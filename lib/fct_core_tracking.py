@@ -1746,4 +1746,3 @@ def track_mcs(
             - all_tracks[tid]["start_timestamp_s"]) / 60.0
 
     return all_tracks
-test2
