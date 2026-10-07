@@ -464,7 +464,7 @@ def find_convective_cores_3d(
     ds : xarray.Dataset
         Dataset d'un pas de temps contenant les variables atmosphériques.
         Doit exposer une coordonnée ``"level"`` (altitudes en mètres) et
-        une coordonnée ``"level_w"`` (altitudes des niveaux W en mètres).
+        une coordonnée ``"level"`` (altitudes des niveaux W en mètres).
     wt_var : str
         Vitesse verticale totale (m/s). Obligatoire.
     ut_var, vt_var : str
@@ -514,7 +514,7 @@ def find_convective_cores_3d(
 
     # 1. Sélection des niveaux verticaux
     z_idx      = _z_indices_between(ds, min_alt_km * 1000.0, max_alt_km * 1000.0)
-    level_vals = ds["level_w"].isel(level_w=z_idx).values.astype(float)
+    level_vals = ds["level"].isel(level=z_idx).values.astype(float)
 
     # 2. Extraction numpy
     wt_np    = ds[wt_var].isel(level=z_idx).values

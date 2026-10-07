@@ -25,7 +25,7 @@ class LegacyLevelSpec:
     parent_id_field: str = "object_id"
 
 
-def _get_legacy_step_result(context: DetectionContext, level: TrackingLevel) -> Dict[str, Any]:
+def _get_legacy_step_result(context, level):
     cache = context.metadata.setdefault("_legacy_detection_cache", {})
     if context.time_index in cache:
         return cache[context.time_index]
@@ -37,15 +37,15 @@ def _get_legacy_step_result(context: DetectionContext, level: TrackingLevel) -> 
 
 
 def _build_level_detector(
-    result_key: str,
-    parent_match_field: Optional[str],
-    parent_id_field: str,
-) -> Callable[[DetectionContext, Optional[Dict[str, Any]], TrackingLevel], List[Dict[str, Any]]]:
+    result_key,
+    parent_match_field,
+    parent_id_field,
+):
     def detector(
-        context: DetectionContext,
-        parent: Optional[Dict[str, Any]],
-        level: TrackingLevel,
-    ) -> List[Dict[str, Any]]:
+        context,
+        parent,
+        level,
+    ):
         step = _get_legacy_step_result(context, level)
         items = list(step.get(result_key, []))
         if parent is None or parent_match_field is None:
@@ -61,10 +61,10 @@ def _build_level_detector(
 
 def create_legacy_levels(
     *,
-    detect_fn: DetectFn,
-    level_specs: List[LegacyLevelSpec],
-    detection_kwargs: Optional[Dict[str, Any]] = None,
-) -> List[TrackingLevel]:
+    detect_fn,
+    level_specs,
+    detection_kwargs = None,
+):
     """Create TrackingLevel objects bound to one legacy detection function."""
     return [
         TrackingLevel(
@@ -81,9 +81,9 @@ def create_legacy_levels(
 
 
 def extract_time_values_and_timestamps(
-    datasets: Iterable[Any],
-    fallback_step_seconds: float = DEFAULT_STEP_SECONDS,
-) -> Dict[str, List[Any]]:
+    datasets,
+    fallback_step_seconds = DEFAULT_STEP_SECONDS,
+):
     """Extract time labels and timestamps from datasets."""
     dataset_list = list(datasets)
     time_values: List[str] = []
@@ -102,11 +102,11 @@ def extract_time_values_and_timestamps(
 
 
 def to_legacy_results_by_time(
-    engine_results: List[Dict[str, Any]],
+    engine_results,
     *,
-    result_key_by_level: Dict[str, str],
-    timestamps_s: Optional[List[float]] = None,
-) -> List[Dict[str, Any]]:
+    result_key_by_level,
+    timestamps_s = None,
+):
     """Convert generic engine output to legacy-like results_by_time structure."""
     legacy: List[Dict[str, Any]] = []
 
@@ -130,12 +130,12 @@ def to_legacy_results_by_time(
 
 def run_legacy_pipeline(
     *,
-    datasets: Iterable[Any],
-    levels: List[TrackingLevel],
-    result_key_by_level: Dict[str, str],
-    track_fns_by_level: Dict[str, TrackFn],
-    track_kwargs_by_level: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
+    datasets,
+    levels,
+    result_key_by_level,
+    track_fns_by_level,
+    track_kwargs_by_level = None,
+):
     """Run engine + convert results + execute legacy tracking functions."""
     time_info = extract_time_values_and_timestamps(datasets)
     engine = HierarchicalTrackingEngine(levels=levels)

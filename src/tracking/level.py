@@ -22,6 +22,7 @@ class TrackingLevel:
     detector: DetectorFn
     parent_name: Optional[str] = None
     params: Dict[str, Any] = field(default_factory=dict)
+    tracker: Any = None
 
     def detect(
         self,
@@ -32,3 +33,11 @@ class TrackingLevel:
         if objects is None:
             return []
         return objects
+
+    def track(self, time_index, time_value, timestamp_s, objects):
+        """Feed the level's tracker with every object detected at this timestep."""
+        if self.tracker is not None:
+            self.tracker.update(time_index, time_value, timestamp_s, objects)
+
+    def finalize_tracks(self):
+        return {} if self.tracker is None else self.tracker.finalize()

@@ -24,47 +24,49 @@ class AdvectedIoUTracker:
     def __init__(
         self,
         track_prefix,
-        index_key = "indices_3d",
-        min_score = 0.1,
-        patience = 0,
-        dx_meters = 1000.0,
-        grid_size = 10000,
-        pre_filter_pixels = 30.0,
-        advection_error_ms = 5.0,
-        shape_buffer_pixels = 3.0,
-        gap_bridge_seconds = 120.0,
-        gap_bridge_max_dist_pixels = 10.0,
-        feature_fn = None,
-        feature_weights = None,
-        feat_ema_alpha = 0.7,
-        w_overlap = 0.6,
-        w_morph = 0.4,
+        index_key                   = "indices_3d",
+        min_score                   = 0.1,
+        patience                    = 0,
+        dx_meters                   = 1000.0,
+        grid_size                   = 10000,
+        pre_filter_pixels           = 30.0,
+        advection_error_ms          = 5.0,
+        shape_buffer_pixels         = 3.0,
+        gap_bridge_seconds          = 120.0,
+        gap_bridge_max_dist_pixels  = 10.0,
+        feature_fn                  = None,
+        feature_weights              = None,
+        feat_ema_alpha               = 0.7,
+        w_overlap                    = 0.6,
+        w_morph                      = 0.4,
         steering_fields: Sequence[str] = ("u_steering", "v_steering"),
-        max_speed_ms = None,
+        max_speed_ms                 = None,
+        detect_splits_merges         = True,
     ):
         if feature_fn is not None and feature_weights is None:
             raise ValueError("feature_weights is required when feature_fn is provided")
 
-        self.track_prefix = track_prefix
-        self.index_key = index_key
-        self.min_score = float(min_score)
-        self.patience = int(patience)
-        self.dx_meters = float(dx_meters)
-        self.grid_size = int(grid_size)
-        self.pre_filter_pixels = float(pre_filter_pixels)
-        self.advection_error_ms = float(advection_error_ms)
-        self.shape_buffer_pixels = float(shape_buffer_pixels)
-        self.gap_bridge_seconds = float(gap_bridge_seconds)
+        self.track_prefix               = track_prefix
+        self.index_key                  = index_key
+        self.min_score                  = float(min_score)
+        self.patience                   = int(patience)
+        self.dx_meters                  = float(dx_meters)
+        self.grid_size                  = int(grid_size)
+        self.pre_filter_pixels          = float(pre_filter_pixels)
+        self.advection_error_ms         = float(advection_error_ms)
+        self.shape_buffer_pixels        = float(shape_buffer_pixels)
+        self.gap_bridge_seconds         = float(gap_bridge_seconds)
         self.gap_bridge_max_dist_pixels = float(gap_bridge_max_dist_pixels)
-        self.feature_fn = feature_fn
-        self.feature_weights = (
+        self.feature_fn                 = feature_fn
+        self.feature_weights            = (
             None if feature_weights is None else (feature_weights / feature_weights.sum()).astype(np.float32)
         )
-        self.feat_ema_alpha = float(feat_ema_alpha)
-        self.w_overlap = float(w_overlap)
-        self.w_morph = float(w_morph)
-        self.steering_fields = steering_fields
-        self.max_speed_ms = max_speed_ms
+        self.feat_ema_alpha              = float(feat_ema_alpha)
+        self.w_overlap                   = float(w_overlap)
+        self.w_morph                     = float(w_morph)
+        self.steering_fields             = steering_fields
+        self.max_speed_ms                = max_speed_ms
+        self.detect_splits_merges        = bool(detect_splits_merges)
 
         self._all_tracks: Dict[str, Dict[str, Any]] = {}
         self._active: Dict[str, Dict[str, Any]] = {}
@@ -209,32 +211,33 @@ class AdvectedIoUTracker:
                 if scores[r, c] >= self.min_score:
                     self._extend_track(track_ids[r], items[c], time_index, time_value, current_ts)
                     winner_by_item[c] = track_ids[r]
-            matched_tracks = set(winner_by_item.values())
-            matched_rows = [r for r, tid in enumerate(track_ids) if tid in matched_tracks]
+            if self.detect_splits_merges:
+                matched_tracks = set(winner_by_item.values())
+                matched_rows = [r for r, tid in enumerate(track_ids) if tid in matched_tracks]
 
-            # Merges: unmatched active track overlapping an already-taken item.
-            for r, tid in enumerate(track_ids):
-                if tid in matched_tracks:
-                    continue
-                for c in sorted(winner_by_item):
-                    if scores[r, c] >= self.min_score:
-                        self._all_tracks[tid].setdefault("events", []).append(
-                            {"type": "merge", "time": time_value, "into": winner_by_item[c]}
+                # Merges: unmatched active track overlapping an already-taken item.
+                for r, tid in enumerate(track_ids):
+                    if tid in matched_tracks:
+                        continue
+                    for c in sorted(winner_by_item):
+                        if scores[r, c] >= self.min_score:
+                            self._all_tracks[tid].setdefault("events", []).append(
+                                {"type": "merge", "time": time_value, "into": winner_by_item[c]}
+                            )
+                            del self._active[tid]
+                            break
+
+                # Splits: unmatched item overlapping an already-matched track.
+                for c, it in enumerate(items):
+                    if c in winner_by_item or not matched_rows:
+                        continue
+                    best = matched_rows[int(np.argmax(scores[matched_rows, c]))]
+                    if scores[best, c] >= self.min_score:
+                        parent_tid = track_ids[best]
+                        self._all_tracks[parent_tid].setdefault("events", []).append(
+                            {"type": "split", "time": time_value, "child_centroid": (it["cy"], it["cx"])}
                         )
-                        del self._active[tid]
-                        break
-
-            # Splits: unmatched item overlapping an already-matched track.
-            for c, it in enumerate(items):
-                if c in winner_by_item or not matched_rows:
-                    continue
-                best = matched_rows[int(np.argmax(scores[matched_rows, c]))]
-                if scores[best, c] >= self.min_score:
-                    parent_tid = track_ids[best]
-                    self._all_tracks[parent_tid].setdefault("events", []).append(
-                        {"type": "split", "time": time_value, "child_centroid": (it["cy"], it["cx"])}
-                    )
-                    split_parent_by_item[c] = parent_tid
+                        split_parent_by_item[c] = parent_tid
 
         for c, it in enumerate(items):
             if c not in winner_by_item:

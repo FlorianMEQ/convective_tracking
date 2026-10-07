@@ -8,12 +8,12 @@ from .level import DetectionContext, TrackingLevel
 class HierarchicalTrackingEngine:
     """Runs an arbitrary number of hierarchical detection levels."""
 
-    def __init__(self, levels: List[TrackingLevel]):
+    def __init__(self, levels):
         self.levels = levels
         self._validate_levels()
-        self.results_by_time: List[Dict[str, Any]] = []
+        self.results_by_time = []
 
-    def _validate_levels(self) -> None:
+    def _validate_levels(self):
         names = {level.name for level in self.levels}
         seen = set()
         for level in self.levels:
@@ -28,12 +28,12 @@ class HierarchicalTrackingEngine:
 
     def run_time_step(
         self,
-        dataset: Any,
-        time_index: int,
-        time_value: Optional[str] = None,
-        timestamp_s: Optional[float] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        dataset,
+        time_index,
+        time_value = None,
+        timestamp_s = None,
+        metadata = None,
+    ):
         time_label = str(time_index if time_value is None else time_value)
         # Copy so per-timestep caches never leak into the caller's (shared) dict.
         context = DetectionContext(
@@ -59,6 +59,7 @@ class HierarchicalTrackingEngine:
                     objects.append(obj)
 
             level_results[level.name] = objects
+            level.track(time_index, time_label, timestamp_s, objects)
 
         step = {"time_index": time_index, "time": time_label, "levels": level_results}
         self.results_by_time.append(step)
@@ -66,11 +67,11 @@ class HierarchicalTrackingEngine:
 
     def run(
         self,
-        datasets: Iterable[Any],
-        time_values: Optional[Iterable[Any]] = None,
-        timestamps_s: Optional[Iterable[float]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
+        datasets,
+        time_values = None,
+        timestamps_s = None,
+        metadata = None,
+    ):
         values = list(time_values) if time_values is not None else []
         ts_values = list(timestamps_s) if timestamps_s is not None else []
 
@@ -84,15 +85,15 @@ class HierarchicalTrackingEngine:
             )
         return self.results_by_time
 
-    def finalize_tracks(self) -> Dict[str, Dict[str, Any]]:
+    def finalize_tracks(self):
         return {level.name: level.finalize_tracks() for level in self.levels}
 
     def run_and_track(
         self,
-        datasets: Iterable[Any],
-        time_values: Optional[Iterable[Any]] = None,
-        timestamps_s: Optional[Iterable[float]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        datasets,
+        time_values = None,
+        timestamps_s = None,
+        metadata = None,
+    ):
         results = self.run(datasets, time_values, timestamps_s, metadata)
         return {"results_by_time": results, "tracks_by_level": self.finalize_tracks()}
