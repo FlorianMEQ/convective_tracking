@@ -4,7 +4,7 @@ This script runs two variants on the same synthetic dataset (a single
 Gaussian/disk "convective cluster", over several timesteps):
 
   1. "Old"  : ``src.old.fct_core_tracking.find_convective_cores_3d`` +
-     ``track_mcs`` / ``track_conv_objects`` / ``track_convective_cores``.
+     ``track_mcs`` / ``track_uc`` / ``track_cc``.
 
   2. "New detection + legacy tracking" : the generic engine
      (``src.tracking``) with the generic detector ``src.tracking.detection``
@@ -32,14 +32,21 @@ Usage
 The script prints the object counts per timestep and per level for both
 pipelines, as well as the number of tracks obtained, and returns a non-zero
 exit code if a divergence is detected.
+
+Note: the ``mcs`` and ``convective_object`` rules now intentionally differ
+from the old algorithm: all objects are 3D, the MCS mask combines the
+hydrometeor content with the Tb envelope (instead of a Tb-only 2D watershed),
+and the hydrometeor condition moved from ``convective_object`` to ``mcs``.
+Divergences on these two levels are therefore expected and are not a
+regression.
 """
 
 from __future__ import annotations
 
+from time import perf_counter
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional, Sequence
 
 # Allow direct execution (`python scripts/compare_legacy_new.py`) in addition
 # to `python -m scripts.compare_legacy_new`: without this, only the scripts/
@@ -51,22 +58,18 @@ if str(_REPO_ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 import xarray as xr
-
+xr.set_options(warn_for_unclosed_files=False)
 from examples.convective_rules import convective_rules
 from src.tracking import AdvectedIoUTracker, HierarchicalTrackingEngine, TrackingLevel, detect_objects
 from src.old.fct_core_tracking import (
-    _CO_FEAT_WEIGHTS,
+    _UC_FEAT_WEIGHTS,
     _FEAT_WEIGHTS,
-    _conv_obj_features,
+    _uc_features,
     _core_features,
     find_convective_cores_3d,
-    track_conv_objects,
-    track_convective_cores,
+    track_uc,
+    track_cc,
     track_mcs,
-)
-from src.tracking.legacy_adapter import (
-    extract_time_values_and_timestamps,
-    to_legacy_results_by_time,
 )
 
 # --- Geometry of the synthetic dataset ---
@@ -85,12 +88,55 @@ def _disk_mask(ny: int, nx: int, cy: float, cx: float, radius: float) -> np.ndar
     yy, xx = np.mgrid[0:ny, 0:nx]
     return (yy - cy) ** 2 + (xx - cx) ** 2 <= radius**2
 
+def extract_time_values_and_timestamps(
+    datasets,
+    fallback_step_seconds = 30.0,
+):
+    dataset_list = list(datasets)
+    time_values = []
+    timestamps_s = []
+
+    for idx, ds in enumerate(dataset_list):
+        if hasattr(ds, "coords") and "time" in ds.coords:
+            raw_time = ds["time"].values
+            time_values.append(str(raw_time))
+            timestamps_s.append(float(pd.Timestamp(raw_time).timestamp()))
+        else:
+            time_values.append(str(idx))
+            timestamps_s.append(float(idx * fallback_step_seconds))
+
+    return {"datasets": dataset_list, "time_values": time_values, "timestamps_s": timestamps_s}
+
+def to_legacy_results_by_time(
+    engine_results,
+    *,
+    result_key_by_level,
+    timestamps_s = None,
+):
+    legacy = []
+
+    for step in engine_results:
+        idx = int(step.get("time_index", 0))
+        has_timestamp = timestamps_s is not None and idx < len(timestamps_s)
+        entry = {
+            "time": step.get("time", str(idx)),
+            "timestamp_s": float(timestamps_s[idx]) if has_timestamp else idx * 30.0,
+        }
+
+        for level_name, result_key in result_key_by_level.items():
+            objs = step.get("levels", {}).get(level_name, [])
+            entry[result_key] = objs
+            entry[f"n_{result_key}"] = len(objs)
+
+        legacy.append(entry)
+
+    return legacy
 
 def make_synthetic_dataset(t_idx: int) -> xr.Dataset:
     """One timestep with a single convective cluster, shifted in x according to t_idx."""
     cy, cx = CENTER0[0], CENTER0[1] + t_idx * SHIFT_PER_STEP
 
-    level = np.linspace(0.0, 20000.0, NLEV)
+    level = np.linspace(0.0, 60000.0, NLEV)
     updraft_xy = _disk_mask(NJ, NI, cy, cx, RADIUS_UPDRAFT)
 
     wt = np.zeros((NLEV, NJ, NI), dtype=np.float32)
@@ -123,33 +169,59 @@ def make_synthetic_dataset(t_idx: int) -> xr.Dataset:
             "MRR": (("level", "nj", "ni"), zeros3d),
             "MSG2_IR108": (("nj", "ni"), tb),
         },
-        coords={"level": level, "level": level, "time": time_val},
+        coords={
+            "level": level,
+            "nj": np.arange(NJ),
+            "ni": np.arange(NI),
+            "time": time_val,
+        },
     )
-
 
 def load_datasets_from_netcdf(
     path: Path,
-    max_steps: Optional[int] = None,
+    max_steps=None,
     start_step: int = 0,
 ) -> list[xr.Dataset]:
-    """Load a real NetCDF file and split it into a list of per-timestep Datasets
-    (a single element if the ``time`` dimension is absent).
-    """
-    with xr.open_dataset(path) as ds:
-        if "time" in ds.dims:
-            n_time = int(ds.sizes["time"])
-            end = n_time if max_steps is None else min(n_time, start_step + max_steps)
-            if start_step >= n_time:
-                raise ValueError(
-                    f"start_step={start_step} >= number of available timesteps ({n_time})"
-                )
-            frames = [ds.isel(time=i).load() for i in range(start_step, end)]
-        else:
-            frames = [ds.load()]
+    """Load a NetCDF file with **minimal memory usage**."""
+    # Liste des variables **strictement nécessaires** pour ton script
+    REQUIRED_VARS = {
+        "WT", "UT", "VT", "MRI", "MRC", "MRS", "MRG", "MRR",
+        "MSG2_IR108", "level", "nj", "ni", "time"
+    }
+
+    # Ouvre le fichier avec **chunking optimal** (1 timestep à la fois)
+    ds = xr.open_dataset(
+        path,
+        chunks={'time': 1, 'level': 20},  # Chunks par timestep + tranches verticales
+        engine='h5netcdf'  # Plus stable que 'netcdf4' pour les gros fichiers
+    )
+
+    # Supprime les variables inutiles **avant chargement**
+    vars_to_drop = [v for v in ds.data_vars if v not in REQUIRED_VARS]
+    if vars_to_drop:
+        ds = ds.drop_vars(vars_to_drop)
+
+    if "time" in ds.dims:
+        n_time = int(ds.sizes["time"])
+        end = n_time if max_steps is None else min(n_time, start_step + max_steps)
+        if start_step >= n_time:
+            raise ValueError(f"start_step={start_step} >= number of available timesteps ({n_time})")
+
+        frames = []
+        for i in range(start_step, end):
+            # Charge **UNIQUEMENT** le timestep i (pas tout le fichier !)
+            frame = ds.isel(time=i).load()
+            # Convertit en **float32** (50% de mémoire en moins vs float64)
+            frame = frame.astype(np.float32)
+            frames.append(frame)
+    else:
+        frames = [ds.astype(np.float32).load()]
+
+    ds.close()  # Ferme explicitement le fichier
     return frames
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+def parse_args(argv = None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--netcdf",
@@ -179,21 +251,32 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def run_old_pipeline(datasets: list[xr.Dataset]) -> dict:
     results_by_time: list[dict] = []
+
+    print("\n=== OLD PIPELINE ===")
+    start_old = perf_counter()
     for ds in datasets:
         results_by_time.extend(find_convective_cores_3d(ds))
-
+    old_time = perf_counter() - start_old
+    print(f"Old pipeline: {old_time:.3f} seconds")
     return {
         "results_by_time": results_by_time,
         "tracks_by_level": {
-            "mcs": track_mcs(results_by_time),
-            "conv_objects": track_conv_objects(results_by_time),
-            "cores": track_convective_cores(results_by_time),
+            "mcs": track_mcs(
+                results_by_time,
+                mcs_min_area_bt_km2=None,  
+                mcs_bt_overshoot_k=None,    
+                mcs_pr_max_mmh=None,       
+                mcs_min_duration_minutes=None
+            ),
+            "conv_objects": track_uc(results_by_time),
+            "cores": track_cc(results_by_time),
         },
     }
 
 
 # Parameters of the new detectors (scientific values of the old code).
 DETECTION_PARAMS = {
+    "vertical_dim": "level",
     "dx_km": 1.0,
     "min_alt_km": 0.0,
     "max_alt_km": 20.0,
@@ -208,8 +291,8 @@ DETECTION_PARAMS = {
     "tb_var": "MSG2_IR108",
     "tb_seed_pct": 0.1,
     "tb_seed_k": 190.0,
-    "tb_env_k": 235.0,
-    "mcs_min_area_km2": 100.0,
+    "tb_env_k": 240.0,
+    "mcs_min_area_km2": 1000.0,
     "w_thresh": 1.0,
     "hydro_min_gkg": 0.01,
     "connectivity": 26,
@@ -223,7 +306,9 @@ DETECTION_PARAMS = {
 }
 
 
-def build_detection_levels() -> list[TrackingLevel]:
+# Dans /workspace/scripts/compare_legacy_new.py
+
+def build_detection_levels():
     """Build detection levels, each bound to its generic tracker."""
     rules = convective_rules(DETECTION_PARAMS)
     return [
@@ -245,7 +330,7 @@ def build_detection_levels() -> list[TrackingLevel]:
         TrackingLevel(
             "convective_object",
             detect_objects,
-            None,
+            "mcs",
             rules["convective_object"],
             tracker=AdvectedIoUTracker(
                 "co",
@@ -253,19 +338,19 @@ def build_detection_levels() -> list[TrackingLevel]:
                 min_score=0.1,
                 patience=2,
                 dx_meters=1000.0,
+                min_iou=0.05,
                 pre_filter_pixels=60.0,
                 advection_error_ms=5.0,
                 shape_buffer_pixels=5.0,
                 gap_bridge_seconds=120.0,
                 gap_bridge_max_dist_pixels=20.0,
-                feature_fn=_conv_obj_features,
-                feature_weights=_CO_FEAT_WEIGHTS,
+                feature_fn=_uc_features,
+                feature_weights=_UC_FEAT_WEIGHTS,
                 feat_ema_alpha=0.7,
                 w_overlap=0.7,
                 w_morph=0.3,
                 steering_fields=("ut_steering", "vt_steering"),
-                # The legacy convective-object tracker does not model these events.
-                detect_splits_merges=False,
+                detect_splits_merges=True,
             ),
         ),
         TrackingLevel(
@@ -277,7 +362,8 @@ def build_detection_levels() -> list[TrackingLevel]:
                 "core",
                 index_key="indices_3d",
                 min_score=0.1,
-                patience=0,
+                patience=1,
+                min_iou=0.02,
                 dx_meters=1000.0,
                 pre_filter_pixels=30.0,
                 advection_error_ms=5.0,
@@ -290,24 +376,30 @@ def build_detection_levels() -> list[TrackingLevel]:
                 w_overlap=0.6,
                 w_morph=0.4,
                 steering_fields=("ut_steering", "vt_steering"),
+                detect_splits_merges=True,
             ),
         ),
     ]
-
 
 def run_new_pipeline(datasets: list[xr.Dataset]) -> dict:
     levels = build_detection_levels()
     time_info = extract_time_values_and_timestamps(datasets)
     engine = HierarchicalTrackingEngine(levels)
+
+    print("\n=== NEW PIPELINE ===")
+    start_new = perf_counter()
     generic_result = engine.run_and_track(
         datasets=time_info["datasets"],
         time_values=time_info["time_values"],
         timestamps_s=time_info["timestamps_s"],
     )
+    new_time = perf_counter() - start_new
+    print(f"New pipeline: {new_time:.3f} seconds")
+
     result_key_by_level = {
-        "mcs": "mcs",
-        "convective_object": "conv_objects",
-        "core": "cores",
+        "mcs": "mcs",          
+        "convective_object": "uc",  
+        "core": "cc", 
     }
     legacy_results = to_legacy_results_by_time(
         generic_result["results_by_time"],
@@ -318,19 +410,48 @@ def run_new_pipeline(datasets: list[xr.Dataset]) -> dict:
         "results_by_time": legacy_results,
         "tracks_by_level": {
             "mcs": track_mcs(legacy_results),
-            "conv_objects": track_conv_objects(legacy_results),
-            "cores": track_convective_cores(legacy_results),
+            "uc": track_uc(legacy_results),
+            "cc": track_cc(legacy_results),
         },
         "generic_tracks_by_level": generic_result["tracks_by_level"],
     }
 
 
 def _footprint(obj, index_key):
-    return frozenset(map(tuple, obj.get(index_key, [])))
-
+    indices = obj.get(index_key, [])
+    if not indices:
+        return frozenset()
+    return frozenset(tuple(idx) for idx in indices)
 
 def _transition_edges(tracks, results_by_time, result_key, index_key):
     """Return continuation, split, and merge links between adjacent steps."""
+    time_by_label = {}
+    for time_index, step in enumerate(results_by_time):
+        time_by_label[step["time"]] = time_index
+
+    # Map each object to its time index and footprint
+    obj_to_info = {}
+    for time_index, step in enumerate(results_by_time):
+        for obj in step.get(result_key, []):
+            footprint = _footprint(obj, index_key)
+            obj_to_info[id(obj)] = (time_index, footprint)
+
+    observations_by_track = {}
+    for track_id, track in tracks.items():
+        observations_by_track[track_id] = [
+            obj_to_info[id(obj)]
+            for obj in track.get("history", [])
+            if id(obj) in obj_to_info
+        ]
+
+    edges = set()
+    for observations in observations_by_track.values():
+        for (previous_time, previous_object), (current_time, current_object) in zip(
+            observations, observations[1:]
+        ):
+            if current_time == previous_time + 1:
+                edges.add(("continue", previous_time, previous_object, current_object))
+
     time_by_object = {}
     time_by_label = {}
     for time_index, step in enumerate(results_by_time):
@@ -402,9 +523,9 @@ def compare_tracking_transitions(old_tracks, new_tracks, detections):
     """Compare both tracker implementations on the exact same detected objects."""
     rows = []
     for result_key, new_level_name, index_key in (
-        ("mcs", "mcs", "indices_2d"),
-        ("conv_objects", "convective_object", "indices_3d"),
-        ("cores", "core", "indices_3d"),
+        ("mcs", "mcs", "indices_3d"),
+        ("uc", "convective_object", "indices_3d"),
+        ("cc", "core", "indices_3d"),
     ):
         old_edges = _transition_edges(
             old_tracks[result_key], detections["results_by_time"], result_key, index_key
@@ -457,7 +578,7 @@ def summarize_tracks(result: dict) -> dict:
     return {name: len(tracks) for name, tracks in result["tracks_by_level"].items()}
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv = None) -> int:
     args = parse_args(argv)
 
     if args.netcdf is not None:
@@ -470,8 +591,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         datasets = [make_synthetic_dataset(t) for t in range(N_STEPS)]
 
     old_result = run_old_pipeline(datasets)
-    new_result = run_new_pipeline(datasets)
 
+    new_result = run_new_pipeline(datasets)
+    
     old_counts = summarize_counts(old_result)
     new_counts = summarize_counts(new_result)
     count_cols = ["n_mcs", "n_conv_objects", "n_cores"]

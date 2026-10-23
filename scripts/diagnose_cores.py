@@ -42,11 +42,17 @@ PARAMS: Dict[str, Any] = {
     "core_w_thresh": 4.0,
 }
 
-# (new level, key of the old result, key of the indices)
+# (new level, key of the old result, key of the old indices, key of the new indices)
+# Note: the "mcs" rule now intentionally differs from the old algorithm: it
+# produces 3D objects (old MCS are 2D, key "indices_2d") combining the
+# hydrometeor content with the Tb envelope. Footprints are therefore not
+# voxel-comparable for "mcs"; only counts are reported for that level.
+# "convective_object" also differs (the hydrometeor condition moved to
+# "mcs"), so differences there are expected too.
 LEVELS = (
-    ("mcs", "mcs", "indices_2d"),
-    ("convective_object", "conv_objects", "indices_3d"),
-    ("core", "cores", "indices_3d"),
+    ("mcs", "mcs", "indices_2d", None),
+    ("convective_object", "conv_objects", "indices_3d", "indices_3d"),
+    ("core", "cores", "indices_3d", "indices_3d"),
 )
 
 
@@ -114,19 +120,29 @@ def run_old(frame: xr.Dataset) -> Dict[str, Any]:
 def compare_levels(old: Dict[str, Any], new: Dict[str, Any]) -> bool:
     print("  Level                  old      new          old only           new only")
     all_same = True
-    for name, old_key, idx_key in LEVELS:
-        so = {voxels(o, idx_key) for o in old[old_key]}
-        sn = {voxels(n, idx_key) for n in new[name]}
+    for name, old_key, old_idx_key, new_idx_key in LEVELS:
+        n_old, n_new = len(old[old_key]), len(new[name])
+        if new_idx_key is None:
+            print(f"  {name:<19} {n_old:>6} {n_new:>8} {'':>17} {'':>18}   N/A (2D vs 3D)")
+            continue
+        so = {voxels(o, old_idx_key) for o in old[old_key]}
+        sn = {voxels(n, new_idx_key) for n in new[name]}
         same = so == sn
         all_same &= same
         print(
-            f"  {name:<19} {len(old[old_key]):>6} {len(new[name]):>8} "
+            f"  {name:<19} {n_old:>6} {n_new:>8} "
             f"{len(so - sn):>17} {len(sn - so):>18}   {'OK' if same else 'DIFFERENT'}"
         )
     return all_same
 
 
 def diagnose_cores(old: Dict[str, Any], new: Dict[str, Any], max_voxels: int) -> None:
+    """Pair cores by their parent convective object and list voxel-level differences.
+
+    Note: ``convective_object`` no longer requires the hydrometeor condition
+    (moved to ``mcs``), so its footprint, and therefore which cores share a
+    parent, may legitimately differ from the old algorithm.
+    """
     dx_km = PARAMS["dx_km"]
     old_objs = {voxels(o, "indices_3d"): o["conv_obj_id"] for o in old["conv_objects"]}
     new_obj_vox = {o["object_id"]: voxels(o, "indices_3d") for o in new["convective_object"]}

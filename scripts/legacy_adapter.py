@@ -5,9 +5,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import pandas as pd
 
-from .engine import HierarchicalTrackingEngine
-from .level import DetectionContext, TrackingLevel
-from .trackers import DEFAULT_STEP_SECONDS
+from ..src.tracking.engine import HierarchicalTrackingEngine
+from ..src.tracking.level import DetectionContext, TrackingLevel
+from ..src.tracking.trackers import DEFAULT_STEP_SECONDS
 
 
 DetectFn = Callable[..., List[Dict[str, Any]]]
@@ -79,53 +79,6 @@ def create_legacy_levels(
         for spec in level_specs
     ]
 
-
-def extract_time_values_and_timestamps(
-    datasets,
-    fallback_step_seconds = DEFAULT_STEP_SECONDS,
-):
-    """Extract time labels and timestamps from datasets."""
-    dataset_list = list(datasets)
-    time_values: List[str] = []
-    timestamps_s: List[float] = []
-
-    for idx, ds in enumerate(dataset_list):
-        if hasattr(ds, "coords") and "time" in ds.coords:
-            raw_time = ds["time"].values
-            time_values.append(str(raw_time))
-            timestamps_s.append(float(pd.Timestamp(raw_time).timestamp()))
-        else:
-            time_values.append(str(idx))
-            timestamps_s.append(float(idx * fallback_step_seconds))
-
-    return {"datasets": dataset_list, "time_values": time_values, "timestamps_s": timestamps_s}
-
-
-def to_legacy_results_by_time(
-    engine_results,
-    *,
-    result_key_by_level,
-    timestamps_s = None,
-):
-    """Convert generic engine output to legacy-like results_by_time structure."""
-    legacy: List[Dict[str, Any]] = []
-
-    for step in engine_results:
-        idx = int(step.get("time_index", 0))
-        has_timestamp = timestamps_s is not None and idx < len(timestamps_s)
-        entry: Dict[str, Any] = {
-            "time": step.get("time", str(idx)),
-            "timestamp_s": float(timestamps_s[idx]) if has_timestamp else idx * DEFAULT_STEP_SECONDS,
-        }
-
-        for level_name, result_key in result_key_by_level.items():
-            objs = step.get("levels", {}).get(level_name, [])
-            entry[result_key] = objs
-            entry[f"n_{result_key}"] = len(objs)
-
-        legacy.append(entry)
-
-    return legacy
 
 
 def run_legacy_pipeline(

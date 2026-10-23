@@ -66,8 +66,6 @@ def compute_component_metrics(
 
     z_idx = np.where(mask3d.any(axis=(1, 2)))[0]
     height_levels = int(z_idx[-1] - z_idx[0] + 1)
-
-    # Median over occupied levels of the horizontal extent (max of x and y extents)
     width_x = _axis_extent(mask3d.any(axis=1)[z_idx])
     width_y = _axis_extent(mask3d.any(axis=2)[z_idx])
     width_median_px = float(np.median(np.maximum(width_x, width_y)))
@@ -100,17 +98,16 @@ def iou_from_sets(a, b):
     return float(inter / union) if union > 0 else 0.0
 
 
-def pack_indices(idx, grid_size = 10000):
-    """Pack a (n, 2) or (n, 3) integer coordinate array into unique int64 keys."""
+def pack_indices(idx, grid_size=10000):
     if idx.size == 0:
         return np.array([], dtype=np.int64)
-    if idx.shape[1] not in (2, 3):
-        raise ValueError("pack_indices only supports arrays with 2 or 3 columns")
-    keys = np.zeros(len(idx), dtype=np.int64)
-    for column in idx.T.astype(np.int64):
-        keys = keys * grid_size + column
-    return keys
-
+    idx = idx.astype(np.int64)
+    if idx.shape[1] == 2:
+        return idx[:, 0] * grid_size + idx[:, 1]
+    elif idx.shape[1] == 3:
+        return idx[:, 0] * (grid_size ** 2) + idx[:, 1] * grid_size + idx[:, 2]
+    else:
+        raise ValueError("pack_indices only supports 2 or 3 columns")
 
 def advect_indices(idx, dy_pixels, dx_pixels):
     """Shift the last two (spatial y, x) coordinate columns of an index array."""
@@ -141,7 +138,6 @@ def merge_stacked_seeds(
     cy, cx = np.ogrid[-r : r + 1, -r : r + 1]
     disk = (cy**2 + cx**2) <= r * r
 
-    # Seeds sorted by decreasing peak intensity: the strongest absorbs weaker ones.
     projections = {int(lbl): np.any(markers == lbl, axis=0) for lbl in labels}
     peaks = {int(lbl): field[markers == lbl].max() for lbl in labels}
     order = sorted(projections, key=peaks.get, reverse=True)
@@ -174,6 +170,7 @@ def recursive_watershed_segmentation(
     stacked_seeds_xy_radius = 3,
     id_prefix = "root",
     _depth = 0,
+    max_depth=3,
 ):
     """Generic recursive H-maxima watershed segmentation of a labeled 3D point set.
     Parameters
@@ -201,9 +198,8 @@ def recursive_watershed_segmentation(
         Each dict has keys ``"id"``, ``"indices"`` (list of (a0, a1, a2)
         tuples) and ``"values"`` (list of floats).
     """
-    if indices.size == 0:
-        return []
-
+    if indices.size == 0 or _depth >= max_depth:
+        return [{"id": id_prefix, "indices": indices.tolist(), "values": values.tolist()}]
 
     origin = indices.min(axis=0)
     grid = np.zeros(indices.max(axis=0) - origin + 1, dtype=float)

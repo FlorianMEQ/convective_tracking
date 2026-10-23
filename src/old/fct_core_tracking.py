@@ -1,53 +1,57 @@
 """
-Détection et suivi hiérarchique 3D des systèmes convectifs (MesoNH).
+Hierarchical 3D detection and tracking of convective systems (MesoNH).
 =====================================================================
 
-Trois niveaux emboîtés détectés sur un unique pas de temps xarray,
-puis reliés dans le temps par trois fonctions de tracking indépendantes :
+Three nested levels detected on a single xarray time step, then linked
+through time by three independent tracking functions:
 
-  Niveau A — MCS
-    Détection  : watershed 2D sur Tb synthétique (approche TOOCAN adaptée)
-                 + extension 3D connexe sur le champ hydro total.
-    Tracking   : IoU 2D, patience = 4 pas de temps.
+  Level A - MCS
+    Detection  : Tb <= 240 K thresholding + 2D connected components (adapted
+                 MOAAP approach) + 3D spatial connected extension on the
+                 total hydrometeor field.
+    Qualification: thresholds applied on the full track in track_mcs
+                 (peak_area >= 10,000 km2, tb_min <= 225 K, pr_max >= 10 mm/h),
+                 which preserves the genesis and decay phases.
+    Tracking   : 2D IoU, patience = 4 time steps.
 
-  Niveau B — Objets convectifs
-    Détection  : composantes connexes 3D sur masque WT ≥ W_MIN_THRESHOLD_B
-                 ET hydro > hydro_min_gkg.
-    Tracking   : IoU 3D advecté + similarité morphologique (hongrois),
-                 patience = 2 pas de temps.
+  Level B - Convective Objects (UC)
+    Detection  : 3D connected components on a WT >= W_MIN_THRESHOLD_B AND
+                 hydro > hydro_min_gkg mask.
+    Tracking   : advected 3D IoU + morphological similarity (Hungarian),
+                 patience = 2 time steps.
 
-  Niveau C — Cœurs convectifs
-    Détection  : watershed 3D récursif avec graines H-Maxima adaptatives
-                 (seuil W_MIN_THRESHOLD_C) à l'intérieur de chaque objet B.
-    Tracking   : IoU 3D advecté + EMA morphologique + splits/merges (hongrois),
-                 patience = 0 pas de temps.
+  Level C - Convective Cores (CC)
+    Detection  : recursive 3D watershed with adaptive H-Maxima seeds
+                 (W_MIN_THRESHOLD_C threshold) inside each UC.
+    Tracking   : advected 3D IoU + morphological EMA + splits/merges
+                 (Hungarian), patience = 1 time step.
 
-API publique
-------------
-    find_convective_cores_3d(ds, ...)       → résultats par pas de temps
-    track_mcs(results_by_time, ...)         → dict de traces Niveau A
-    track_conv_objects(results_by_time, ...) → dict de traces Niveau B
-    track_convective_cores(results_by_time, ...) → dict de traces Niveau C
-    segment_core_recursive(core_data, ...)  → segmentation standalone Niveau C
+Public API
+----------
+    find_convective_cores_3d(ds, ...)      -> per-time-step results
+    track_mcs(results_by_time, ...) -> dict of Level A tracks
+    track_uc(results_by_time, ...)  -> dict of Level B (UC) tracks
+    track_cc(results_by_time, ...)  -> dict of Level C (CC) tracks
+    segment_core_recursive(core_data, ...) -> standalone Level C segmentation
 
-Usage minimal
+Minimal usage
 -------------
     import xarray as xr
     from lib.fct_core_tracking import (
         find_convective_cores_3d,
-        track_mcs, track_conv_objects, track_convective_cores,
+        track_mcs, track_uc, track_cc,
     )
 
     results = []
     for ds_t in xr.open_dataset("simulation.nc").groupby("time"):
         results.extend(find_convective_cores_3d(ds_t))
 
-    mcs_tracks  = track_mcs(results)
-    co_tracks   = track_conv_objects(results)
-    core_tracks = track_convective_cores(results)
+    mcs_tracks = track_mcs(results)
+    uc_tracks  = track_uc(results)
+    cc_tracks  = track_cc(results)
 
-Dépendances
------------
+Dependencies
+------------
     numpy, pandas, scipy (ndimage, optimize), scikit-image (morphology, segmentation)
 """
 
@@ -61,37 +65,46 @@ from skimage.morphology import h_maxima
 from skimage.segmentation import watershed
 
 # ================================================================
-# CONSTANTES GLOBALES
+# GLOBAL CONSTANTS
 # ================================================================
 
-# --- Résolution horizontale (identique en x et y) ---
+# --- Horizontal resolution (same in x and y) ---
 DX_METERS = 1000.0          # m/pixel
 DX_KM     = DX_METERS / 1000.0  # km/pixel
 
-# --- Seuils de vitesse verticale ---
-W_MIN_THRESHOLD_B = 1.0   # Niveau B : masque binaire WT (m/s)
-W_MIN_THRESHOLD_C = 4.0   # Niveau C : watershed + h-maxima adaptatif (m/s)
+# --- Vertical velocity thresholds ---
+W_MIN_THRESHOLD_B = 1.0   # Level B: binary WT mask (m/s)
+W_MIN_THRESHOLD_C = 4.0   # Level C: watershed + adaptive h-maxima (m/s)
 
-# --- H-Maxima adaptatif (Niveau C) ---
-# h = SLOPE * (WT_max - W_MIN_THRESHOLD_C), borné dans [H_ADAPT_MIN, H_ADAPT_MAX]
-H_ADAPT_SLOPE = 0.3       # pente de la relation h(WT_max)
-H_ADAPT_MIN   = 1.0       # plancher de h (m/s)
-H_ADAPT_MAX   = 10.0      # plafond de h (m/s)
+# --- Adaptive H-Maxima (Level C) ---
+# h = SLOPE * (WT_max - W_MIN_THRESHOLD_C), clamped to [H_ADAPT_MIN, H_ADAPT_MAX]
+H_ADAPT_SLOPE = 0.3       # slope of the h(WT_max) relation
+H_ADAPT_MIN   = 1.0       # floor of h (m/s)
+H_ADAPT_MAX   = 10.0      # ceiling of h (m/s)
 
-# --- Connectivité 3D ---
-CONNECTIVITY_3D = 18      # 6=face, 18=face+arête, 26=face+arête+coin
+# --- 3D connectivity ---
+CONNECTIVITY_3D = 18      # 6=face, 18=face+edge, 26=face+edge+corner
 
-# --- Fusion de graines verticalement empilées (Niveau C) ---
+# --- Merging of vertically stacked seeds (Level C) ---
 MERGE_VERTICAL_STACKED_SEEDS = True
-STACKED_SEEDS_XY_RADIUS      = 3   # rayon de dilatation 2D pour détecter l'empilement (pixels)
+STACKED_SEEDS_XY_RADIUS      = 3   # 2D dilation radius used to detect stacking (pixels)
+
+# --- MCS vertical extension: "connected to cloud top" tolerance (Level A) ---
+# A per-column top_z check alone lets a shallow, spatially isolated patch
+# through: if a column's only hydro content is a low, disconnected pocket, that
+# pocket IS "the top of its own column" and would otherwise qualify. Requiring
+# a label's own highest point to be within this tolerance of the tallest point
+# reached anywhere in the footprint filters those out, while still tolerating
+# the few-hundred-meter dips expected across a genuinely anvil-connected top.
+MCS_TOP_CONNECT_TOL_M = 2000.0
 
 
 # ================================================================
-# UTILITAIRES INTERNES
+# INTERNAL UTILITIES
 # ================================================================
 
 def _z_indices_between(ds, zmin_m, zmax_m):
-    """Retourne les indices des niveaux verticaux compris entre zmin_m et zmax_m."""
+    """Return the vertical level indices between zmin_m and zmax_m."""
     z_vals = ds.coords["level"].values.astype(float)
     mask = (z_vals >= zmin_m) & (z_vals <= zmax_m)
     return np.nonzero(mask)[0]
@@ -99,21 +112,21 @@ def _z_indices_between(ds, zmin_m, zmax_m):
 
 def _compute_component_metrics(mask3d, level_vals=None):
     """
-    Métriques géométriques d'un composant 3D (Niveau B ou C).
+    Geometric metrics of a 3D component (Level B or C).
 
     Parameters
     ----------
     mask3d : ndarray bool, shape (nz, ny, nx)
-        Masque local du composant.
-    level_vals : ndarray float, optionnel
-        Altitudes des niveaux en mètres. Si fourni, hauteur et volume sont
-        calculés en unités physiques (km, km³). Sinon, on suppose dz = 1 km.
+        Local mask of the component.
+    level_vals : ndarray float, optional
+        Level altitudes in meters. If provided, height and volume are
+        computed in physical units (km, km3). Otherwise dz = 1 km is assumed.
 
     Returns
     -------
     dict
-        Largeurs, aires, volume et hauteur en pixels (sans level_vals)
-        ou en km / km² / km³ (avec level_vals). Résolution horizontale : DX_KM.
+        Widths, areas, volume and height in pixels (without level_vals) or
+        in km / km2 / km3 (with level_vals). Horizontal resolution: DX_KM.
     """
     voxels = int(mask3d.sum())
     proj   = mask3d.any(axis=0)
@@ -167,7 +180,7 @@ def _compute_component_metrics(mask3d, level_vals=None):
     width_x_km = float(width_x) * DX_KM
     width_y_km = float(width_y) * DX_KM
     area_km2   = float(area)    * DX_KM ** 2
-    volume_km3 = float(voxels)  * DX_KM ** 2   # dz supposé 1 km si level_vals absent
+    volume_km3 = float(voxels)  * DX_KM ** 2   # dz assumed 1 km if level_vals is absent
     height_km  = float(height)
 
     area_max_dz_km2 = float(area_max_dz)  * DX_KM ** 2
@@ -197,9 +210,9 @@ def _compute_component_metrics(mask3d, level_vals=None):
 
 
 def _get_structure_3d(connectivity=CONNECTIVITY_3D):
-    """Élément structurant 3D de connectivité 6, 18 ou 26."""
+    """3D structuring element with 6, 18 or 26 connectivity."""
     if connectivity not in (6, 18, 26):
-        raise ValueError(f"Connectivité 3D invalide : {connectivity}. Utiliser 6, 18 ou 26.")
+        raise ValueError(f"Invalid 3D connectivity: {connectivity}. Use 6, 18 or 26.")
     s = np.zeros((3, 3, 3), dtype=bool)
     for dz in (-1, 0, 1):
         for dy in (-1, 0, 1):
@@ -217,39 +230,48 @@ def _get_structure_3d(connectivity=CONNECTIVITY_3D):
     return s
 
 
+# Precomputed structuring elements - these were previously rebuilt on every
+# call (a 27-iteration Python loop for _get_structure_3d, or a fresh np.ones
+# allocation) even though CONNECTIVITY_3D and the 2D/26-connectivity cases
+# used here never change at runtime. 26-connectivity is a full 3x3x3 True
+# array by construction, identical to np.ones((3, 3, 3), dtype=bool).
+_STRUCT_2D_8CONN        = np.ones((3, 3), dtype=bool)
+_STRUCT_3D_26CONN       = np.ones((3, 3, 3), dtype=bool)
+_STRUCTURE_3D_RECURSIVE = _get_structure_3d(CONNECTIVITY_3D)
+
+
 def _merge_stacked_markers(markers, grid_3d, xy_radius=STACKED_SEEDS_XY_RADIUS):
     """
-    Fusionne les graines H-Maxima verticalement empilées.
+    Merge vertically stacked H-Maxima seeds.
 
-    Deux graines sont considérées empilées si leurs projections 2D (XY) se
-    recouvrent après dilatation disque de rayon ``xy_radius`` pixels. La
-    graine la plus intense (WT_max) absorbe l'autre.
+    Two seeds are considered stacked if their 2D (XY) projections overlap
+    after a disk dilation of radius ``xy_radius`` pixels. The most intense
+    seed (WT_max) absorbs the other.
 
     Parameters
     ----------
     markers : ndarray int
-        Étiquettes des graines (sortie de cc_label sur h_maxima).
+        Seed labels (output of cc_label on h_maxima).
     grid_3d : ndarray float
-        Champ WT local (même shape que markers).
+        Local WT field (same shape as markers).
     xy_radius : int
-        Rayon du disque de dilatation en pixels.
+        Dilation disk radius in pixels.
 
     Returns
     -------
     merged : ndarray int
-        Marqueurs après fusion.
+        Markers after merging.
     n_after : int
-        Nombre de graines après fusion.
+        Number of seeds after merging.
     n_merged : int
-        Nombre de fusions effectuées.
+        Number of merges performed.
     """
     labels = np.unique(markers)
     labels = labels[labels > 0]
     if len(labels) <= 1:
         return markers, len(labels), 0
 
-    r   = int(max(0, xy_radius))
-    d   = 2 * r + 1
+    r = int(max(0, xy_radius))
     cy_d, cx_d = np.ogrid[-r:r + 1, -r:r + 1]
     disk = (cy_d ** 2 + cx_d ** 2) <= r * r
 
@@ -295,74 +317,73 @@ def _merge_stacked_markers(markers, grid_3d, xy_radius=STACKED_SEEDS_XY_RADIUS):
     return merged, n_after, max(0, n_before - n_after)
 
 
-def _detect_level_a(tb_2d, hydro_3d, time_hms, tb_seed_pct, tb_seed_k,
-                    tb_env_k, hydro_min_gkg, mcs_min_area_km2):
+def _detect_level_a(tb_2d, inprr_2d, hydro_3d, time_hms,
+                    tb_env_k, hydro_min_gkg, mcs_min_area_km2,
+                    wt_3d=None, level_vals=None, ut_3d=None, vt_3d=None):
     """
-    Détection des MCS (Niveau A) — approche TOOCAN adaptée aux données modèle.
+    Detection of candidate convective shields (Level A) - adapted MOAAP approach.
 
-    Étapes :
-      1. Définir l'enveloppe convective : pixels Tb ≤ tb_env_k.
-      2. Définir les germes :
-         - si tb_seed_pct fourni : tb_seed_pct % des pixels les plus froids
-           dans l'enveloppe (adaptatif, recommandé pour données modèle) ;
-         - sinon : seuil fixe Tb ≤ tb_seed_k (TOOCAN satellite, 190 K).
-      3. Watershed 2D sur Tb (croissance vers les pixels plus chauds).
-      4. Filtrage par aire minimale (mcs_min_area_km2).
-      5. Extension 3D connexe : pour chaque MCS 2D, extraction du volume
-         hydro connecté depuis le sommet des colonnes dans l'empreinte 2D.
+    Steps:
+      1. Tb <= tb_env_k thresholding -> binary cold shield mask.
+      2. 2D connected components (8-connectivity) -> candidate objects.
+      3. Noise filter by minimum area (mcs_min_area_km2).
+      4. Per-object metrics: tb_min_k, pr_max_mmh (if inprr_2d is provided).
+      5. Connected 3D spatial extension on the total hydro field (unchanged).
+      6. Geometric and physical metrics on this 3D structure via
+         ``_compute_component_metrics`` (volume, per-z-level areas/widths,
+         WT statistics), symmetric with what is done at Levels B/C.
 
-    Tous les paramètres sont transmis sans valeurs par défaut depuis
-    find_convective_cores_3d — cette fonction n'est pas destinée à être
-    appelée directement.
+    MCS qualification (peak area thresholds, Tb overshoot, precipitation) is
+    performed a posteriori in track_mcs on the full track, which preserves
+    the genesis and decay phases.
 
     Parameters
     ----------
     tb_2d : ndarray float, shape (ny, nx)
-        Température de brillance synthétique (K).
+        Synthetic brightness temperature (K).
+    inprr_2d : ndarray float or None, shape (ny, nx)
+        Instantaneous surface precipitation rate (mm/h).
+        None if the variable is not available in the dataset.
     hydro_3d : ndarray float, shape (nz, ny, nx)
-        Champ d'hydrométéores total (g/kg).
+        Total hydrometeor field (g/kg).
     time_hms : str
-        Heure du pas de temps au format HH:MM:SS.
-    tb_seed_pct : float or None
-        Percentile (dans [0, 100]) des pixels les plus froids utilisés comme
-        germes. None pour basculer sur le seuil fixe tb_seed_k.
-    tb_seed_k : float
-        Seuil fixe de température des germes (K). Utilisé si tb_seed_pct=None.
+        Time step in HH:MM:SS format.
     tb_env_k : float
-        Seuil d'enveloppe convective (K).
+        Cold shield threshold (K). Recommended default: 240 K (adapted from MOAAP's 241 K).
     hydro_min_gkg : float
-        Seuil minimal d'hydrométéores pour l'extension 3D (g/kg).
+        Minimum hydrometeor threshold for the 3D extension (g/kg).
     mcs_min_area_km2 : float
-        Aire minimale d'un MCS (km²).
+        Minimum noise-filter area (km2). Filters out small objects before
+        tracking; must stay well below track_mcs's MCS qualification threshold.
+    wt_3d : ndarray float or None, shape (nz, ny, nx)
+        Total vertical velocity (m/s). If provided, WT statistics
+        (max/mean/99pct) are computed on the connected 3D structure (the raw
+        per-voxel array is not kept in the output dict - too large at MCS
+        scale). None disables these fields.
+    level_vals : ndarray float or None
+        W-level altitudes (m). If provided, ``volume_km3``/``height_km`` are
+        weighted by the actual ``dz`` instead of the dz=1 km assumption.
+    ut_3d, vt_3d : ndarray float or None, shape (nz, ny, nx)
+        Wind components (m/s). If provided, averaged over the connected 3D
+        structure (``ut_ms``/``vt_ms``, distinct from the steering wind).
 
     Returns
     -------
     mcs_list : list of dict
-        Un dict par MCS détecté (métriques 2D + 3D + champ "_label" interne).
-    ws_labels : ndarray int, shape (ny, nx)
-        Labels du watershed 2D (utilisés pour associer les objets B à un MCS).
+        One dict per detected candidate object.
+    obj_labels : ndarray int, shape (ny, nx)
+        2D label map (used to associate Level B objects with a parent A).
     """
     env_mask = tb_2d <= tb_env_k
 
-    if tb_seed_pct is not None:
-        cold_pixels = tb_2d[env_mask]
-        seed_mask = (tb_2d <= float(np.percentile(cold_pixels, tb_seed_pct))
-                     if cold_pixels.size > 0
-                     else np.zeros_like(tb_2d, dtype=bool))
-    else:
-        seed_mask = tb_2d <= tb_seed_k
+    obj_labels, n_objs = cc_label(env_mask, structure=_STRUCT_2D_8CONN)
 
-    struct_2d    = np.ones((3, 3), dtype=bool)
-    seed_labels, n_seeds = cc_label(seed_mask, structure=struct_2d)
-
-    if n_seeds == 0:
+    if n_objs == 0:
         return [], np.zeros_like(tb_2d, dtype=np.int32)
 
-    ws_labels = watershed(tb_2d, seed_labels, mask=env_mask)
-
     mcs_list = []
-    for lab in range(1, n_seeds + 1):
-        cc_mask_2d = ws_labels == lab
+    for lab in range(1, n_objs + 1):
+        cc_mask_2d = obj_labels == lab
         area_km2   = float(cc_mask_2d.sum())
         if area_km2 < mcs_min_area_km2:
             continue
@@ -376,10 +397,9 @@ def _detect_level_a(tb_2d, hydro_3d, time_hms, tb_seed_pct, tb_seed_k,
         local_vol = np.zeros((nz_loc, y_max - y_min + 1, x_max - x_min + 1), dtype=bool)
         local_vol[:, loc_ys, loc_xs] = hydro_3d[:, ys, xs] > hydro_min_gkg
 
-        # Connectivité 26 : nécessaire pour relier des voxels via des voisins diagonaux
-        # dans des colonnes présentant des niveaux vides intermédiaires.
-        struct3d        = np.ones((3, 3, 3), dtype=bool)
-        labeled_local, _ = cc_label(local_vol, structure=struct3d)
+        # 26-connectivity: needed to link voxels through diagonal neighbors
+        # in columns that have empty intermediate levels.
+        labeled_local, _ = cc_label(local_vol, structure=_STRUCT_3D_26CONN)
 
         col_bool  = local_vol[:, loc_ys, loc_xs]
         has_any   = col_bool.any(axis=0)
@@ -388,7 +408,30 @@ def _detect_level_a(tb_2d, hydro_3d, time_hms, tb_seed_pct, tb_seed_k,
                              -1)
         valid      = top_z >= 0
         top_labels = (set(labeled_local[top_z[valid], loc_ys[valid], loc_xs[valid]].tolist())
-                      - {0})
+                     - {0})
+
+        # A label reaching "the top of its own column" is not enough: a
+        # column whose only content is a shallow, spatially isolated pocket
+        # (no connectivity path to the tall structure at all) trivially
+        # satisfies that check too. Keep only labels whose own highest point
+        # is within MCS_TOP_CONNECT_TOL_M of the tallest point reached
+        # anywhere in this footprint - i.e. genuinely connected to the real
+        # cloud top, not just locally topping out low.
+        if top_labels and valid.any():
+            global_top_z = int(top_z[valid].max())
+            if level_vals is not None:
+                above_tol = np.nonzero(
+                    level_vals[:global_top_z + 1] >= level_vals[global_top_z] - MCS_TOP_CONNECT_TOL_M
+                )[0]
+                min_top_z = int(above_tol.min()) if above_tol.size else global_top_z
+            else:
+                min_top_z = max(0, global_top_z - 3)
+            label_reaches_top = set()
+            for lbl in top_labels:
+                lbl_top_z = np.nonzero(np.any(labeled_local == lbl, axis=(1, 2)))[0].max()
+                if lbl_top_z >= min_top_z:
+                    label_reaches_top.add(lbl)
+            top_labels = label_reaches_top
 
         if top_labels:
             conn_local     = np.isin(labeled_local, list(top_labels))
@@ -396,30 +439,79 @@ def _detect_level_a(tb_2d, hydro_3d, time_hms, tb_seed_pct, tb_seed_k,
         else:
             connected_mask = np.zeros((nz_loc, len(ys)), dtype=bool)
 
-        n_vox_3d = int(connected_mask.sum())
-        z_active  = np.where(connected_mask.any(axis=1))[0]
+        # Dense local mask (nz_loc, ny_bbox, nx_bbox) - rebuilt from the
+        # "columns" representation above so _compute_component_metrics can be
+        # reused just like at Levels B/C (volume, per-z-level areas and
+        # widths, symmetric with what is done at B/C).
+        dense_mask = np.zeros((nz_loc, y_max - y_min + 1, x_max - x_min + 1), dtype=bool)
+        dense_mask[:, loc_ys, loc_xs] = connected_mask
+        metrics_a = _compute_component_metrics(dense_mask, level_vals)
+
+        z3, y3_loc, x3_loc = np.where(dense_mask)
+        y3, x3   = y3_loc + y_min, x3_loc + x_min
+        z_active = np.where(dense_mask.any(axis=(1, 2)))[0]
+
+        # WT statistics computed on the fly over the voxels (z3,y3,x3) - the
+        # raw per-voxel array and the 3D indices are not kept in the output
+        # dict: at Level A (MCS footprints, often thousands of voxels), that
+        # would make every history snapshot excessively heavy.
+        if wt_3d is not None and z3.size > 0:
+            wt_vals_a = wt_3d[z3, y3, x3]
+            wt_max_a  = float(np.nanmax(wt_vals_a))
+            wt_mean_a = float(np.nanmean(wt_vals_a))
+            wt_99_a   = float(np.nanpercentile(wt_vals_a, 99))
+        else:
+            wt_max_a = wt_mean_a = wt_99_a = None
+
+        ut_mean_a = float(np.nanmean(ut_3d[z3, y3, x3])) if ut_3d is not None and z3.size > 0 else None
+        vt_mean_a = float(np.nanmean(vt_3d[z3, y3, x3])) if vt_3d is not None and z3.size > 0 else None
+
+        if level_vals is not None and z_active.size > 0:
+            height_min_km_a = float(level_vals[z_active.min()]) / 1000.0
+            height_max_km_a = float(level_vals[z_active.max()]) / 1000.0
+        else:
+            height_min_km_a = height_max_km_a = None
+
+        n_vox_3d = int(dense_mask.sum())
         tb_cc     = tb_2d[cc_mask_2d]
+        pr_max    = (float(inprr_2d[cc_mask_2d].max())
+                     if inprr_2d is not None else None)
         mcs_list.append({
-            "mcs_id":           f"t{time_hms}_mcs{lab}",
-            "time_value":       time_hms,
-            "area_2d_km2":      area_km2,
-            "seed_area_2d_km2": float((seed_mask & cc_mask_2d).sum()),
-            "n_voxels_3d":      n_vox_3d,
-            "tb_min_k":         float(tb_cc.min()),
-            "tb_mean_k":        float(tb_cc.mean()),
-            "z_top_idx":        int(z_active.max()) if z_active.size > 0 else 0,
-            "z_base_idx":       int(z_active.min()) if z_active.size > 0 else 0,
-            "centroid_x":       float(xs.mean()),
-            "centroid_y":       float(ys.mean()),
-            "indices_2d":       list(zip(ys.tolist(), xs.tolist())),
-            "_label":           int(lab),
+            "mcs_id":      f"t{time_hms}_mcs{lab}",
+            "time_value":  time_hms,
+            "area_2d_km2": area_km2,
+            "n_voxels_3d": n_vox_3d,
+            "volume_km3":       metrics_a["volume_km3"],
+            "area_max_dz_km2":  metrics_a["area_max_dz_km2"],
+            "area_mean_km2":    metrics_a["area_mean_km2"],
+            "area_median_km2":  metrics_a["area_median_km2"],
+            "width_max_km":     float(metrics_a["width_max_dz"]),
+            "width_mean_km":    metrics_a["width_mean_km"],
+            "width_median_km":  metrics_a["width_median_km"],
+            "height_km":        metrics_a["height_km"],
+            "height_min_km":    height_min_km_a,
+            "height_max_km":    height_max_km_a,
+            "wt_max_ms":        wt_max_a,
+            "wt_mean_ms":       wt_mean_a,
+            "wt_99pct_ms":      wt_99_a,
+            "ut_ms":            ut_mean_a,
+            "vt_ms":            vt_mean_a,
+            "tb_min_k":    float(tb_cc.min()),
+            "tb_mean_k":   float(tb_cc.mean()),
+            "pr_max_mmh":  pr_max,
+            "z_top_idx":   int(z_active.max()) if z_active.size > 0 else 0,
+            "z_base_idx":  int(z_active.min()) if z_active.size > 0 else 0,
+            "centroid_x":  float(xs.mean()),
+            "centroid_y":  float(ys.mean()),
+            "indices_2d":  list(zip(ys.tolist(), xs.tolist())),
+            "_label":      int(lab),
         })
 
-    return mcs_list, ws_labels
+    return mcs_list, obj_labels
 
 
 # ================================================================
-# DÉTECTION PRINCIPALE (entrée publique)
+# MAIN DETECTION (public entry point)
 # ================================================================
 
 def find_convective_cores_3d(
@@ -440,83 +532,74 @@ def find_convective_cores_3d(
     wice_var="WICE",
     vim_var="VIM",
     tb_var="MSG2_IR108",
-    tb_np_override=None,
     w_thresh=W_MIN_THRESHOLD_B,
     min_alt_km=0,
     max_alt_km=20,
-    tb_seed_k=190.0,
-    tb_seed_pct=0.1,
-    tb_env_k=235.0,
+    tb_env_k=240.0,
     hydro_min_gkg=0.01,
-    mcs_min_area_km2=100.0,
+    mcs_min_area_km2=1000.0,
 ):
     """
-    Détection hiérarchique 3D pour un unique pas de temps.
+    Hierarchical 3D detection for a single time step.
 
-    Enchaîne les trois niveaux de détection (A → B → C) sur le dataset
-    xarray ``ds`` sélectionné pour un pas de temps. Les résultats sont
-    renvoyés dans une liste à un élément, format compatible avec les
-    fonctions de tracking (``track_mcs``, ``track_conv_objects``,
-    ``track_convective_cores``).
+    Chains the three detection levels (A -> B -> C) on the xarray dataset
+    ``ds`` selected for one time step. Results are returned as a
+    single-element list, a format compatible with the tracking functions
+    (``track_mcs``, ``track_uc``, ``track_cc``).
 
     Parameters
     ----------
     ds : xarray.Dataset
-        Dataset d'un pas de temps contenant les variables atmosphériques.
-        Doit exposer une coordonnée ``"level"`` (altitudes en mètres) et
-        une coordonnée ``"level"`` (altitudes des niveaux W en mètres).
+        Dataset for one time step containing the atmospheric variables.
+        Must expose a ``"level"`` coordinate (altitudes in meters) and a
+        ``"level"`` coordinate (W-level altitudes in meters).
     wt_var : str
-        Vitesse verticale totale (m/s). Obligatoire.
+        Total vertical velocity (m/s). Required.
     ut_var, vt_var : str
-        Composantes zonale et méridionale du vent (m/s). Optionnelles
-        (vent steering mis à 0 si absentes).
+        Zonal and meridional wind components (m/s). Optional (steering wind
+        set to 0 if absent).
     mri_var, mrc_var : str
-        Rapport de mélange glace primaire et eau liquide nuageuse (g/kg).
-        Obligatoires (utilisées pour hydro_3d).
+        Primary ice and cloud liquid water mixing ratio (g/kg).
+        Required (used for hydro_3d).
     mrv_var, mrs_var, mrg_var, mrr_var : str
-        Vapeur, neige, graupel, pluie (g/kg). Optionnelles.
+        Vapor, snow, graupel, rain (g/kg). Optional.
     temp_var, pres_var : str
-        Température (K) et pression (Pa). Optionnelles.
+        Temperature (K) and pressure (Pa). Optional.
     iwp_var, inprr_var, wice_var, vim_var : str
-        Variables 2D intégrées (IWP kg/m², précip mm/h, etc.). Optionnelles.
+        Integrated 2D variables (IWP kg/m2, precip mm/h, etc.). Optional.
     tb_var : str
-        Température de brillance synthétique (K). Si absente du dataset,
-        la détection Niveau A est désactivée.
+        Synthetic brightness temperature (K). If absent from the dataset,
+        Level A detection is disabled.
     w_thresh : float
-        Seuil WT pour le masque binaire Niveau B (m/s). Défaut : W_MIN_THRESHOLD_B.
+        WT threshold for the Level B binary mask (m/s). Default: W_MIN_THRESHOLD_B.
     min_alt_km, max_alt_km : float
-        Borne inférieure et supérieure de la colonne analysée (km).
-    tb_seed_k : float
-        Seuil fixe de germe Tb (K) — utilisé si tb_seed_pct=None.
-    tb_seed_pct : float or None
-        Percentile des pixels Tb les plus froids utilisés comme germes
-        dans l'enveloppe tb_env_k (0.1 = 0.1% des pixels les plus froids).
-        Mettre à None pour basculer sur tb_seed_k.
+        Lower and upper bound of the analyzed column (km).
     tb_env_k : float
-        Seuil d'enveloppe convective (K). Défaut : 235 K.
+        Level A cold shield threshold (K). Default: 240 K (adapted from MOAAP's 241 K).
     hydro_min_gkg : float
-        Seuil minimal de contenu en hydrométéores (g/kg). Défaut : 0.01 g/kg.
+        Minimum hydrometeor content threshold (g/kg). Default: 0.01 g/kg.
     mcs_min_area_km2 : float
-        Aire minimale d'un MCS Niveau A (km²). Défaut : 100 km².
+        Level A noise-filter minimum area (km2). Default: 1000 km2. Must stay
+        well below track_mcs's MCS qualification threshold (10,000 km2).
 
     Returns
     -------
     list of dict
-        Liste à un élément contenant un dictionnaire avec les clés :
+        Single-element list containing a dict with the keys:
         ``"time"``, ``"timestamp_s"``,
         ``"mcs"`` (list), ``"n_mcs"``,
-        ``"conv_objects"`` (list), ``"n_conv_objects"``,
-        ``"cores"`` (list), ``"n_cores"``,
+        ``"uc"`` (list), ``"n_uc"``,
+        ``"cc"`` (list), ``"n_cc"``,
         ``"n_raw_cores"``, ``"n_segmented_cores"``,
         ``"n_subgroups_from_watershed"``.
     """
     results_by_time = []
 
-    # 1. Sélection des niveaux verticaux
+    # 1. Select vertical levels
     z_idx      = _z_indices_between(ds, min_alt_km * 1000.0, max_alt_km * 1000.0)
     level_vals = ds["level"].isel(level=z_idx).values.astype(float)
 
-    # 2. Extraction numpy
+    # 2. Extract numpy arrays
     wt_np    = ds[wt_var].isel(level=z_idx).values
     ut_np    = ds[ut_var].isel(level=z_idx).values if ut_var    and ut_var    in ds else None
     vt_np    = ds[vt_var].isel(level=z_idx).values if vt_var    and vt_var    in ds else None
@@ -532,37 +615,31 @@ def find_convective_cores_3d(
     inprr_np = ds[inprr_var].values if inprr_var and inprr_var in ds else None
     wice_np  = ds[wice_var].values  if wice_var  and wice_var  in ds else None
     vim_np   = ds[vim_var].values   if vim_var   and vim_var   in ds else None
-    if tb_np_override is not None:
-        tb_np = tb_np_override
-    else:
-        tb_np = ds[tb_var].values if tb_var and tb_var in ds else None
+    tb_np = ds[tb_var].values if tb_var and tb_var in ds else None
 
-    # 3. Champ hydro total (masque Niveau B + extension 3D Niveau A)
+    # 3. Total hydro field (UC mask + 3D MCS extension)
     hydro_3d = mri_np + mrc_np
-    if mrs_np is not None: hydro_3d = hydro_3d + mrs_np
-    if mrg_np is not None: hydro_3d = hydro_3d + mrg_np
-    if mrr_np is not None: hydro_3d = hydro_3d + mrr_np
 
-    # Masque binaire Niveau B : WT > seuil ET présence d'hydrométéores
+    # Binary UC mask (Level B): WT > threshold AND hydrometeors present
     mask_np = (wt_np > w_thresh) & (hydro_3d > hydro_min_gkg)
 
     raw_time    = ds["time"].values
     time_hms    = str(raw_time).split("T")[-1].split(".")[0]
     timestamp_s = float(pd.Timestamp(raw_time).timestamp())
 
-    # 3b. Détection MCS Niveau A
+    # 3b. Level A (MCS) detection
     mcs_list   = []
     env_labels = None
     _label_map = {}
     if tb_np is not None:
         mcs_list, env_labels = _detect_level_a(
-            tb_np, hydro_3d, time_hms,
-            tb_seed_pct, tb_seed_k, tb_env_k,
-            hydro_min_gkg, mcs_min_area_km2,
+            tb_np, inprr_np, hydro_3d, time_hms,
+            tb_env_k, hydro_min_gkg, mcs_min_area_km2,
+            wt_3d=wt_np, level_vals=level_vals, ut_3d=ut_np, vt_3d=vt_np,
         )
         _label_map = {m.pop("_label"): m["mcs_id"] for m in mcs_list}
 
-        # Vent steering de chaque MCS : moyenne de colonne sur le footprint 2D
+        # Steering wind of each MCS: column average over the 2D footprint
         for m in mcs_list:
             yx = m.get("indices_2d", [])
             if yx and ut_np is not None and vt_np is not None:
@@ -577,35 +654,31 @@ def find_convective_cores_3d(
     if not mask_np.any():
         results_by_time.append({
             "time": time_hms, "timestamp_s": timestamp_s,
-            "mcs": mcs_list, "conv_objects": [], "n_cores": 0, "cores": [],
+            "mcs": mcs_list, "uc": [], "n_cc": 0, "cc": [],
         })
         return results_by_time
 
-    # 4. Composantes connexes 3D (Niveau B)
-    structure = np.ones((3, 3, 3), dtype=bool)
-    labels, nlabels = cc_label(mask_np, structure=structure)
+    # 4. 3D connected components (UC - Level B)
+    labels, nlabels = cc_label(mask_np, structure=_STRUCT_3D_26CONN)
     if nlabels == 0:
         results_by_time.append({
             "time": time_hms, "timestamp_s": timestamp_s,
-            "mcs": mcs_list, "conv_objects": [], "n_cores": 0, "cores": [],
+            "mcs": mcs_list, "uc": [], "n_cc": 0, "cc": [],
         })
         return results_by_time
 
-    # 5. Boîtes englobantes
+    # 5. Bounding boxes
     slices = find_objects(labels)
-    corps_list        = []
-    conv_objects_list = []
+    cc_list        = []
+    uc_list = []
     nb_raw_cores = nb_segmented_cores = nb_subgroups_from_watershed = 0
 
-    # 6. Boucle sur chaque objet convectif (Niveau B)
+    # 6. Loop over each UC (Level B)
     for lab, sl in enumerate(slices, 1):
         if sl is None:
             continue
         comp = (labels[sl] == lab)
         if comp.sum() < 5:
-            continue
-        metrics_pre = _compute_component_metrics(comp)
-        if metrics_pre["width"] < 5 or metrics_pre["area"] < 15:
             continue
 
         z_coords, y_coords, x_coords = np.where(comp)
@@ -615,12 +688,16 @@ def find_convective_cores_3d(
 
         zmin_co, zmax_co = int(z_coords.min()), int(z_coords.max())
         level_vals_co    = level_vals[zmin_co : zmax_co + 1] if level_vals is not None else None
+        # width/area do not depend on level_vals (see _compute_component_metrics),
+        # so a single call serves both the noise filter below and the full metrics.
         metrics_co       = _compute_component_metrics(comp, level_vals_co)
+        if metrics_co["width"] < 5 or metrics_co["area"] < 15:
+            continue
         unique_2d_co     = list(set(zip(y_coords.tolist(), x_coords.tolist())))
         cx_co = float(np.mean(x_coords))
         cy_co = float(np.mean(y_coords))
 
-        # MCS parent via centroïde
+        # Parent MCS via centroid
         mcs_id_co = None
         if env_labels is not None:
             cy_i    = int(np.clip(round(cy_co), 0, env_labels.shape[0] - 1))
@@ -629,7 +706,7 @@ def find_convective_cores_3d(
             if lbl_at in _label_map:
                 mcs_id_co = _label_map[lbl_at]
 
-        # Vent steering : centroïde vertical ±2 niveaux
+        # Steering wind: vertical centroid +/- 2 levels
         z_mean_co = float(np.mean(z_coords))
         zc_co     = int(round(z_mean_co))
         z_lo_co   = max(zmin_co, zc_co - 2)
@@ -649,55 +726,67 @@ def find_convective_cores_3d(
             ut_mean_co = vt_mean_co = 0.0
             ut_steering_co = vt_steering_co = 0.0
 
-        conv_obj_id  = f"t{time_hms}_co{lab}"
+        mask_base_co      = (z_coords == zmin_co)
+        y_base_co, x_base_co = y_coords[mask_base_co], x_coords[mask_base_co]
+        width_base_km_co  = (float(max(int(x_base_co.max() - x_base_co.min() + 1),
+                                       int(y_base_co.max() - y_base_co.min() + 1)))
+                             if y_base_co.size > 0 else 0.0)
+        wt_vals_co        = wt_np[z_coords, y_coords, x_coords]
+
+        uc_id  = f"t{time_hms}_uc{lab}"
         indices_3d   = list(zip(z_coords.tolist(), y_coords.tolist(), x_coords.tolist()))
-        conv_objects_list.append({
-            "conv_obj_id":     conv_obj_id,
+        uc_list.append({
+            "uc_id":     uc_id,
             "time_value":      time_hms,
             "mcs_id":          mcs_id_co,
-            "area_max_dz_km2": metrics_co["area_max_dz_km2"],
-            "volume_km3":      metrics_co["volume_km3"],
-            "width_max_km":    float(metrics_co["width_max_dz"]),
-            "width_median_km": metrics_co["width_median_km"],
-            "height_km":       metrics_co["height_km"],
-            "height_min_km":   float(level_vals[zmin_co]) / 1000.0,
-            "height_max_km":   float(level_vals[zmax_co]) / 1000.0,
-            "centroid_x":      cx_co,
-            "centroid_y":      cy_co,
-            "centroid_z":      z_mean_co,
-            "max_speed":       float(np.nanmax(wt_np[z_coords, y_coords, x_coords])),
-            "speed_99pct":     float(np.nanpercentile(wt_np[z_coords, y_coords, x_coords], 99)),
-            "ut_mean":         ut_mean_co,
-            "vt_mean":         vt_mean_co,
-            "ut_steering":     ut_steering_co,
-            "vt_steering":     vt_steering_co,
-            "indices_2d":      unique_2d_co,
-            "indices_3d":      indices_3d,
-            "n_cores":         0,
+            "area_max_dz_km2":  metrics_co["area_max_dz_km2"],
+            "area_mean_km2":    metrics_co["area_mean_km2"],
+            "area_median_km2":  metrics_co["area_median_km2"],
+            "volume_km3":       metrics_co["volume_km3"],
+            "width_max_km":     float(metrics_co["width_max_dz"]),
+            "width_base_km":    width_base_km_co,
+            "width_mean_km":    metrics_co["width_mean_km"],
+            "width_median_km":  metrics_co["width_median_km"],
+            "height_km":        metrics_co["height_km"],
+            "height_min_km":    float(level_vals[zmin_co]) / 1000.0,
+            "height_max_km":    float(level_vals[zmax_co]) / 1000.0,
+            "centroid_x":       cx_co,
+            "centroid_y":       cy_co,
+            "centroid_z":       z_mean_co,
+            "wt_max_ms":        float(np.nanmax(wt_vals_co)),
+            "wt_mean_ms":       float(np.nanmean(wt_vals_co)),
+            "wt_99pct_ms":      float(np.nanpercentile(wt_vals_co, 99)),
+            "ut_ms":            ut_mean_co,
+            "vt_ms":            vt_mean_co,
+            "ut_steering_ms":   ut_steering_co,
+            "vt_steering_ms":   vt_steering_co,
+            "indices_2d":       unique_2d_co,
+            "indices_3d":       indices_3d,
+            "n_cc":          0,
         })
 
-        # 7. Pré-filtrage WT > W_MIN_THRESHOLD_C + CC3D pour le Niveau C
-        # On restreint au sous-volume WT > 4 m/s puis on re-étiquette les composantes
-        # connexes (connectivité 26) pour que chaque cluster isolé soit traité et filtré
-        # indépendamment — même comportement que l'ancien code monolithique à 4 m/s.
+        # 7. Pre-filter WT > W_MIN_THRESHOLD_C + CC3D for Level C (CC)
+        # Restrict to the WT > 4 m/s sub-volume then re-label the connected
+        # components (26-connectivity) so each isolated cluster is processed
+        # and filtered independently - same behavior as the former
+        # monolithic 4 m/s code.
         wt_vals_b = wt_np[z_coords, y_coords, x_coords]
         mask_c    = wt_vals_b > W_MIN_THRESHOLD_C
         if not mask_c.any():
-            conv_objects_list[-1]["n_cores"] = 0
+            uc_list[-1]["n_cc"] = 0
             continue
 
         zc = z_coords[mask_c]; yc = y_coords[mask_c]; xc = x_coords[mask_c]
         wt_c = wt_vals_b[mask_c]
 
-        # CC3D sur le sous-volume à 4 m/s (connectivité 26)
+        # CC3D on the 4 m/s sub-volume (26-connectivity)
         zmin_c, zmax_c = int(zc.min()), int(zc.max())
         ymin_c, ymax_c = int(yc.min()), int(yc.max())
         xmin_c, xmax_c = int(xc.min()), int(xc.max())
         shape_c = (zmax_c - zmin_c + 1, ymax_c - ymin_c + 1, xmax_c - xmin_c + 1)
         vol_c   = np.zeros(shape_c, dtype=bool)
         vol_c[zc - zmin_c, yc - ymin_c, xc - xmin_c] = True
-        struct26 = np.ones((3, 3, 3), dtype=bool)
-        labels_c, n_clusters_c = cc_label(vol_c, structure=struct26)
+        labels_c, n_clusters_c = cc_label(vol_c, structure=_STRUCT_3D_26CONN)
 
         subgroups_indices = []
         for clab in range(1, n_clusters_c + 1):
@@ -711,7 +800,7 @@ def find_convective_cores_3d(
             cl_z_g = cl_z + zmin_c; cl_y_g = cl_y + ymin_c; cl_x_g = cl_x + xmin_c
             cl_wt  = wt_np[cl_z_g, cl_y_g, cl_x_g]
             item_cl = {
-                "group_id":     f"{conv_obj_id}_c{clab}",
+                "cc_id":     f"{uc_id}_cc{clab}",
                 "indices_3d":   list(zip(cl_z_g.tolist(), cl_y_g.tolist(), cl_x_g.tolist())),
                 "wt_3d_values": cl_wt.tolist(),
             }
@@ -722,7 +811,7 @@ def find_convective_cores_3d(
                 nb_subgroups_from_watershed += len(sg)
             subgroups_indices.extend(sg)
 
-        n_cores_this_obj = 0
+        n_cc_this_uc = 0
         for sg_data in subgroups_indices:
             sg_indices = np.array(sg_data["indices_3d"])
             if len(sg_indices) == 0:
@@ -757,7 +846,7 @@ def find_convective_cores_3d(
             y_mean = float(np.mean(y_vals))
             z_mean = float(np.mean(z_vals))
 
-            # Vent steering : centroïde vertical ±2 niveaux
+            # Steering wind: vertical centroid +/- 2 levels
             zc     = int(round(z_mean))
             z_lo   = max(int(zmin), zc - 2)
             z_hi   = min(int(zmax), zc + 2)
@@ -789,24 +878,31 @@ def find_convective_cores_3d(
             pres_vals = pres_np[z_vals, y_vals, x_vals].tolist() if pres_np is not None else []
 
             item = {
-                "group_id":       sg_data["group_id"],
-                "conv_obj_id":    conv_obj_id,
-                "mcs_id":         mcs_id_co,
-                "time_value":     time_hms,
-                "area_max_dz":    metrics["area_max_dz_km2"],
-                "area_mean":      metrics["area_mean_km2"],
-                "area_median":    metrics["area_median_km2"],
-                "volume":         metrics["volume_km3"],
-                "height_min":     height_min_km,
-                "height_max":     height_max_km,
-                "height":         metrics["height_km"],
-                "width_base":     width_km_base,
-                "width_max":      float(metrics["width_max_dz"]),
-                "width_mean":     metrics["width_mean_km"],
-                "width_median":   metrics["width_median_km"],
-                "max_speed":      vmax,
-                "mean_speed":     vmean,
-                "speed_99pct":    v99,
+                "cc_id":        sg_data["cc_id"],
+                "uc_id":     uc_id,
+                "mcs_id":          mcs_id_co,
+                "time_value":      time_hms,
+                "area_max_dz_km2": metrics["area_max_dz_km2"],
+                "area_mean_km2":   metrics["area_mean_km2"],
+                "area_median_km2": metrics["area_median_km2"],
+                "volume_km3":      metrics["volume_km3"],
+                "height_min_km":   height_min_km,
+                "height_max_km":   height_max_km,
+                "height_km":       metrics["height_km"],
+                "width_base_km":   width_km_base,
+                "width_max_km":    float(metrics["width_max_dz"]),
+                "width_mean_km":   metrics["width_mean_km"],
+                "width_median_km": metrics["width_median_km"],
+                "wt_max_ms":       vmax,
+                "wt_mean_ms":      vmean,
+                "wt_99pct_ms":     v99,
+                "centroid_x":      x_mean,
+                "centroid_y":      y_mean,
+                "centroid_z":      z_mean,
+                "ut_ms":           ut_mean_val,
+                "vt_ms":           vt_mean_val,
+                "ut_steering_ms":  ut_steering,
+                "vt_steering_ms":  vt_steering,
                 "mri_3d_values":  mri_vals.tolist(),
                 "mri_mean":       mri_mean_val,
                 "mrc_3d_values":  mrc_vals.tolist(),
@@ -815,11 +911,6 @@ def find_convective_cores_3d(
                 "mrs_3d_values":  mrs_vals, "mrs_mean": mrs_mean_val,
                 "mrg_3d_values":  mrg_vals, "mrg_mean": mrg_mean_val,
                 "mrr_3d_values":  mrr_vals, "mrr_mean": mrr_mean_val,
-                "localization": {
-                    "ut": ut_mean_val, "vt": vt_mean_val,
-                    "ut_steering": ut_steering, "vt_steering": vt_steering,
-                    "x": x_mean, "y": y_mean, "z": z_mean,
-                },
                 "indices_3d":      sg_data["indices_3d"],
                 "indices_2d":      unique_yx,
                 "wt_3d_values":    wt_vals.tolist(),
@@ -853,21 +944,32 @@ def find_convective_cores_3d(
                     item["vim_mean"]      = float(np.nanmean(vim_vals))
                     item["vim_max"]       = float(np.nanmax(vim_vals))
 
-            corps_list.append(item)
-            n_cores_this_obj += 1
+            cc_list.append(item)
+            n_cc_this_uc += 1
 
-        conv_objects_list[-1]["n_cores"] = n_cores_this_obj
+        uc_list[-1]["n_cc"] = n_cc_this_uc
 
-    count = len(corps_list)
+    # Top-down hierarchical constraint:
+    #   a UC must contain >=1 CC AND belong to an MCS
+    # uc_list = [
+    #     uc for uc in uc_list
+    #     if uc["n_cc"] > 0 and uc["mcs_id"] is not None
+    # ]
+
+    # # CC whose parent UC was filtered out are excluded (B->C cascade)
+    # surviving_uc_ids = {uc["uc_id"] for uc in uc_list}
+    # cc_list = [c for c in cc_list if c["uc_id"] in surviving_uc_ids]
+
+    count = len(cc_list)
     results_by_time.append({
         "time":                       time_hms,
         "timestamp_s":                timestamp_s,
         "mcs":                        mcs_list,
         "n_mcs":                      len(mcs_list),
-        "conv_objects":               conv_objects_list,
-        "n_conv_objects":             len(conv_objects_list),
-        "n_cores":                    count,
-        "cores":                      corps_list,
+        "uc":               uc_list,
+        "n_uc":             len(uc_list),
+        "n_cc":                    count,
+        "cc":                      cc_list,
         "n_raw_cores":                nb_raw_cores,
         "n_segmented_cores":          nb_segmented_cores,
         "n_subgroups_from_watershed": nb_subgroups_from_watershed,
@@ -876,41 +978,40 @@ def find_convective_cores_3d(
 
 
 # ================================================================
-# SEGMENTATION RÉCURSIVE NIVEAU C (utilisable en standalone)
+# LEVEL C RECURSIVE SEGMENTATION (usable standalone)
 # ================================================================
 
 def segment_core_recursive(core_data, level_vals, min_width_threshold=1, depth=0):
     """
-    Segmentation récursive d'un objet convectif par watershed H-Maxima adaptatif (Niveau C).
+    Recursive segmentation of a convective object via adaptive H-Maxima watershed (Level C).
 
-    À chaque niveau de récursion, les graines sont détectées par H-Maxima sur
-    le champ WT local, puis le watershed sépare les cœurs distincts. L'appel
-    s'arrête quand un sous-groupe est suffisamment petit
-    (``width_median ≤ min_width_threshold``) ou quand le watershed ne produit
-    qu'une seule région.
+    At each recursion level, seeds are detected via H-Maxima on the local WT
+    field, then the watershed separates the distinct cores. Recursion stops
+    when a subgroup is small enough (``width_median <= min_width_threshold``)
+    or when the watershed produces only a single region.
 
-    Cette fonction peut être appelée directement sur un objet quelconque pour
-    en extraire les cœurs convectifs sans passer par ``find_convective_cores_3d``.
+    This function can be called directly on any object to extract its
+    convective cores without going through ``find_convective_cores_3d``.
 
     Parameters
     ----------
     core_data : dict
-        Doit contenir :
-        - ``"group_id"``    : identifiant de l'objet parent (str)
-        - ``"indices_3d"``  : liste de tuples (z, y, x) en coordonnées globales
-        - ``"wt_3d_values"``: liste de valeurs WT correspondantes (m/s)
+        Must contain:
+       - ``"cc_id"``    : parent object identifier (str)
+       - ``"indices_3d"``  : list of (z, y, x) tuples in global coordinates
+       - ``"wt_3d_values"``: list of matching WT values (m/s)
     level_vals : ndarray float
-        Altitudes des niveaux en mètres (coordonnée globale, pas le sous-domaine).
+        Level altitudes in meters (global coordinate, not the sub-domain).
     min_width_threshold : float
-        Largeur médiane (km) en dessous de laquelle la récursion s'arrête.
+        Median width (km) below which recursion stops.
     depth : int
-        Niveau de récursion courant (0 = racine). Ne pas modifier manuellement.
+        Current recursion level (0 = root). Do not set manually.
 
     Returns
     -------
     list of dict
-        Un dict par cœur final avec les clés :
-        ``"group_id"``, ``"indices_3d"``, ``"wt_3d_values"``.
+        One dict per final core with the keys:
+        ``"cc_id"``, ``"indices_3d"``, ``"wt_3d_values"``.
     """
     indices_3d   = np.array(core_data["indices_3d"])
     wt_3d_values = np.array(core_data["wt_3d_values"])
@@ -939,10 +1040,10 @@ def segment_core_recursive(core_data, level_vals, min_width_threshold=1, depth=0
         return [{
             "indices_3d":    indices_3d.tolist(),
             "wt_3d_values":  wt_3d_values.tolist(),
-            "group_id":      core_data.get("subgroup_id", core_data.get("group_id", "root")),
+            "cc_id":      core_data.get("cc_subid", core_data.get("cc_id", "root")),
         }]
 
-    structure_3d = _get_structure_3d(CONNECTIVITY_3D)
+    structure_3d = _STRUCTURE_3D_RECURSIVE
     wt_local_max = np.max(grid_3d)
 
     h_dynamique = H_ADAPT_SLOPE * (wt_local_max - W_MIN_THRESHOLD_C)
@@ -956,7 +1057,7 @@ def segment_core_recursive(core_data, level_vals, min_width_threshold=1, depth=0
         markers, num_markers, _ = _merge_stacked_markers(
             markers, grid_3d, xy_radius=STACKED_SEEDS_XY_RADIUS)
 
-    mask_global    = grid_3d > 0   # l'entrée est déjà pré-filtrée à W_MIN_THRESHOLD_C
+    mask_global    = grid_3d > 0   # input is already pre-filtered at W_MIN_THRESHOLD_C
     segmentation_3d = watershed(-grid_3d, markers, mask=mask_global)
 
     unique_labels = np.unique(segmentation_3d)
@@ -966,7 +1067,7 @@ def segment_core_recursive(core_data, level_vals, min_width_threshold=1, depth=0
         return [{
             "indices_3d":    indices_3d.tolist(),
             "wt_3d_values":  wt_3d_values.tolist(),
-            "group_id":      core_data.get("subgroup_id", core_data.get("group_id", "root")),
+            "cc_id":      core_data.get("cc_subid", core_data.get("cc_id", "root")),
         }]
 
     subgroups = []
@@ -979,11 +1080,11 @@ def segment_core_recursive(core_data, level_vals, min_width_threshold=1, depth=0
         y_global = y_local + ymin
         x_global = x_local + xmin
 
-        parent_id       = core_data.get("subgroup_id", core_data.get("group_id"))
+        parent_id       = core_data.get("cc_subid", core_data.get("cc_id"))
         new_subgroup_id = f"{parent_id}_d{depth}_s{int(label_id)}"
 
         subgroup = {
-            "subgroup_id":  new_subgroup_id,
+            "cc_subid":  new_subgroup_id,
             "indices_3d":   np.column_stack((z_global, y_global, x_global)).tolist(),
             "wt_3d_values": wt_vals_sub.tolist(),
         }
@@ -995,83 +1096,413 @@ def segment_core_recursive(core_data, level_vals, min_width_threshold=1, depth=0
 
 
 # ================================================================
-# TRACKING — UTILITAIRES COMMUNS
+# TRACKING - COMMON UTILITIES
 # ================================================================
 
-_GRID_SIZE = np.int64(600)  # > taille max de la grille (500 dans CADDIWAF)
+_GRID_SIZE = np.int64(600)  # > max grid size (500 in CADDIWAF)
 
 
 def _pack_indices(idx3d):
-    """Encode (z, y, x) en clé int64 unique pour comparaison rapide d'ensembles."""
+    """
+    Encode (z, y, x) into a unique int64 key for fast set comparison.
+
+    Returned sorted: every caller only ever uses these keys for order-
+    independent IoU comparisons (see ``_iou``), and ``_advect_shift`` only
+    adds a constant offset to y/x before re-packing, which preserves sort
+    order. Sorting once here (instead of on every pairwise IoU call) is what
+    lets ``_iou`` skip re-sorting its inputs.
+    """
     G = _GRID_SIZE
-    return (idx3d[:, 0].astype(np.int64) * G * G
+    keys = (idx3d[:, 0].astype(np.int64) * G * G
             + idx3d[:, 1].astype(np.int64) * G
             + idx3d[:, 2].astype(np.int64))
+    keys.sort()
+    return keys
 
 
 def _pack_indices_2d(yx_list):
-    """Encode une liste de (y, x) en clés int64 uniques."""
+    """Encode a list of (y, x) into unique int64 keys, sorted (see ``_pack_indices``)."""
     arr = np.array(yx_list, dtype=np.int64)
-    return arr[:, 0] * _GRID_SIZE + arr[:, 1]
+    keys = arr[:, 0] * _GRID_SIZE + arr[:, 1]
+    keys.sort()
+    return keys
 
 
 def _advect_shift(idx3d, u_pix, v_pix):
-    """Décale horizontalement les voxels d'un objet par advection (pixels)."""
+    """Horizontally shift an object's voxels by advection (pixels)."""
     shifted = idx3d.copy()
-    shifted[:, 1] += int(round(v_pix))   # y (méridional)
+    shifted[:, 1] += int(round(v_pix))   # y (meridional)
     shifted[:, 2] += int(round(u_pix))   # x (zonal)
     return shifted
 
 
 def _advect_shift_2d(keys, u_pix, v_pix):
-    """Décale des clés 2D packées (y*G+x) par advection sans dépaquetage."""
+    """
+    Shift packed 2D keys (y*G+x) by advection without unpacking them.
+
+    Adding the same constant offset to every element of a sorted array keeps
+    it sorted, so a sorted ``keys`` input stays sorted here - no re-sort needed.
+    """
     return keys + int(round(v_pix)) * _GRID_SIZE + int(round(u_pix))
 
 
+def _rebuild_geometry_3d(indices_a, indices_b):
+    """
+    Rebuild a local mask from the union of two disjoint voxel sets and
+    return the ``_compute_component_metrics`` metrics of the recombined
+    object, along with the (deduplicated) union of indices.
+
+    Horizontal metrics (areas, per-z-level widths) do not depend on ``dz``
+    and are therefore exact. ``height_km`` assumes a uniform ``dz`` (this
+    pipeline stage has no access to the run's ``level_vals``) - the only
+    approximation in this reconstruction.
+    """
+    idx = np.unique(np.array(list(indices_a) + list(indices_b), dtype=np.int64), axis=0)
+    mins  = idx.min(axis=0)
+    shape = tuple((idx.max(axis=0) - mins + 1).tolist())
+    mask  = np.zeros(shape, dtype=bool)
+    local = idx - mins
+    mask[local[:, 0], local[:, 1], local[:, 2]] = True
+    return _compute_component_metrics(mask), idx
+
+
+def _union_indices(a, b):
+    """Deduplicated union of two index lists (tuples (y,x) or (z,y,x))."""
+    return [tuple(v) for v in ({tuple(v) for v in a} | {tuple(v) for v in b})]
+
+
+def _merge_extra_ids(a, b, id_key):
+    """
+    Track the raw detection id(s) absorbed into a fused entry.
+
+    ``fused = dict(a)`` keeps only ``a``'s own id (e.g. ``uc_id``) and
+    silently drops ``b``'s - but ``b``'s raw id still exists as a genuinely
+    separate object in the per-time-step detection output (``results.pkl``,
+    since fusing the track's history does not and cannot retroactively merge
+    the two blobs' raw pixels). Downstream consumers keyed on the raw id
+    (e.g. the gif scripts, which color a track's pixels by looking up its
+    raw id) need this list to attribute the fragment's own pixels to the
+    surviving track too, instead of falling back to an "untracked" color.
+    """
+    extra_key = f"{id_key}_extra"
+    return list(a.get(extra_key, [])) + [b[id_key]]
+
+
+def _wavg(va, vb, wa, wb):
+    """Exact weighted average of two means over disjoint sets."""
+    if va is None or vb is None:
+        return va if va is not None else vb
+    wsum = wa + wb
+    return (va * wa + vb * wb) / wsum if wsum > 0 else 0.5 * (va + vb)
+
+
+def _vmax(va, vb):
+    vals = [v for v in (va, vb) if v is not None]
+    return max(vals) if vals else None
+
+
+def _vmin(va, vb):
+    vals = [v for v in (va, vb) if v is not None]
+    return min(vals) if vals else None
+
+
+def _fused_stat(a, b, raw_key, kind):
+    """Exact statistic recomputed over the union of two raw per-voxel arrays."""
+    ra, rb = a.get(raw_key), b.get(raw_key)
+    if ra is None or rb is None:
+        return None
+    arr = np.asarray(list(ra) + list(rb), dtype=np.float64)
+    if arr.size == 0:
+        return None
+    if kind == "mean":
+        return float(np.nanmean(arr))
+    if kind == "max":
+        return float(np.nanmax(arr))
+    if kind == "p99":
+        return float(np.nanpercentile(arr, 99))
+    raise ValueError(kind)
+
+
+def _fuse_cc_cores(a, b):
+    """
+    Merge two disjoint CC (Level C) detections originating from the same
+    physical object, fragmented over one time step. All intensity
+    statistics are recomputed exactly from the raw per-voxel arrays
+    (``wt_3d_values``, ``mri/mrc/mrv/mrs/mrg/mrr_3d_values``, ...), which
+    are kept at this level.
+    """
+    geom, idx = _rebuild_geometry_3d(a["indices_3d"], b["indices_3d"])
+    n_a, n_b  = len(a["indices_3d"]), len(b["indices_3d"])
+
+    fused = dict(a)
+    fused["cc_id_extra"]     = _merge_extra_ids(a, b, "cc_id")
+    fused["indices_3d"]      = idx.tolist()
+    fused["indices_2d"]      = _union_indices(a.get("indices_2d", []), b.get("indices_2d", []))
+    fused["volume_km3"]      = a.get("volume_km3", 0.0) + b.get("volume_km3", 0.0)
+    fused["height_min_km"]   = _vmin(a.get("height_min_km"), b.get("height_min_km"))
+    fused["height_max_km"]   = _vmax(a.get("height_max_km"), b.get("height_max_km"))
+    fused["area_max_dz_km2"] = geom["area_max_dz_km2"]
+    fused["area_mean_km2"]   = geom["area_mean_km2"]
+    fused["area_median_km2"] = geom["area_median_km2"]
+    fused["width_max_km"]    = float(geom["width_max_dz"])
+    fused["width_mean_km"]   = geom["width_mean_km"]
+    fused["width_median_km"] = geom["width_median_km"]
+    fused["height_km"]       = geom["height_km"]
+    fused["centroid_x"] = _wavg(a.get("centroid_x"), b.get("centroid_x"), n_a, n_b)
+    fused["centroid_y"] = _wavg(a.get("centroid_y"), b.get("centroid_y"), n_a, n_b)
+    fused["centroid_z"] = _wavg(a.get("centroid_z"), b.get("centroid_z"), n_a, n_b)
+    fused["ut_ms"]           = _wavg(a.get("ut_ms"), b.get("ut_ms"), n_a, n_b)
+    fused["vt_ms"]           = _wavg(a.get("vt_ms"), b.get("vt_ms"), n_a, n_b)
+    fused["ut_steering_ms"]  = _wavg(a.get("ut_steering_ms"), b.get("ut_steering_ms"), n_a, n_b)
+    fused["vt_steering_ms"]  = _wavg(a.get("vt_steering_ms"), b.get("vt_steering_ms"), n_a, n_b)
+
+    for raw_key, mean_key, max_key, p99_key in [
+        ("wt_3d_values",   "wt_mean_ms", "wt_max_ms", "wt_99pct_ms"),
+        ("mri_3d_values",  "mri_mean",   None,        None),
+        ("mrc_3d_values",  "mrc_mean",   None,        None),
+        ("mrv_3d_values",  "mrv_mean",   None,        None),
+        ("mrs_3d_values",  "mrs_mean",   None,        None),
+        ("mrg_3d_values",  "mrg_mean",   None,        None),
+        ("mrr_3d_values",  "mrr_mean",   None,        None),
+        ("temp_3d_values", "temp_mean",  None,        None),
+        ("pres_3d_values", "pres_mean",  None,        None),
+    ]:
+        if raw_key in a and raw_key in b:
+            fused[raw_key] = list(a[raw_key]) + list(b[raw_key])
+            if mean_key: fused[mean_key] = _fused_stat(a, b, raw_key, "mean")
+            if max_key:  fused[max_key]  = _fused_stat(a, b, raw_key, "max")
+            if p99_key:  fused[p99_key]  = _fused_stat(a, b, raw_key, "p99")
+
+    if "iwp_2d_values" in a and "iwp_2d_values" in b:
+        fused["iwp_2d_values"] = list(a["iwp_2d_values"]) + list(b["iwp_2d_values"])
+        fused["iwp_mean"] = _fused_stat(a, b, "iwp_2d_values", "mean")
+        fused["iwp_max"]  = _fused_stat(a, b, "iwp_2d_values", "max")
+
+    return fused
+
+
+def _fuse_uc_cores(a, b):
+    """
+    Merge two disjoint UC (Level B) detections. No raw per-voxel array is
+    kept at this level: ``wt_max_ms`` (max, exact) and ``wt_mean_ms``
+    (voxel-count-weighted average, exact) are reconstructed, but
+    ``wt_99pct_ms`` is a percentile - not reconstructible without the raw
+    per-voxel values - and is removed from the merged dict rather than kept
+    with a wrong value.
+    """
+    geom, idx = _rebuild_geometry_3d(a["indices_3d"], b["indices_3d"])
+    n_a, n_b  = len(a["indices_3d"]), len(b["indices_3d"])
+
+    fused = dict(a)
+    fused["uc_id_extra"]     = _merge_extra_ids(a, b, "uc_id")
+    fused["indices_3d"]      = idx.tolist()
+    fused["indices_2d"]      = _union_indices(a.get("indices_2d", []), b.get("indices_2d", []))
+    fused["volume_km3"]      = a.get("volume_km3", 0.0) + b.get("volume_km3", 0.0)
+    fused["height_min_km"]   = _vmin(a.get("height_min_km"), b.get("height_min_km"))
+    fused["height_max_km"]   = _vmax(a.get("height_max_km"), b.get("height_max_km"))
+    fused["area_max_dz_km2"] = geom["area_max_dz_km2"]
+    fused["area_mean_km2"]   = geom["area_mean_km2"]
+    fused["area_median_km2"] = geom["area_median_km2"]
+    fused["width_max_km"]    = float(geom["width_max_dz"])
+    fused["width_mean_km"]   = geom["width_mean_km"]
+    fused["width_median_km"] = geom["width_median_km"]
+    fused["height_km"]       = geom["height_km"]
+    fused["centroid_x"] = _wavg(a.get("centroid_x"), b.get("centroid_x"), n_a, n_b)
+    fused["centroid_y"] = _wavg(a.get("centroid_y"), b.get("centroid_y"), n_a, n_b)
+    fused["centroid_z"] = _wavg(a.get("centroid_z"), b.get("centroid_z"), n_a, n_b)
+    fused["wt_max_ms"]  = _vmax(a.get("wt_max_ms"), b.get("wt_max_ms"))
+    fused["wt_mean_ms"] = _wavg(a.get("wt_mean_ms"), b.get("wt_mean_ms"), n_a, n_b)
+    fused["ut_ms"]           = _wavg(a.get("ut_ms"), b.get("ut_ms"), n_a, n_b)
+    fused["vt_ms"]           = _wavg(a.get("vt_ms"), b.get("vt_ms"), n_a, n_b)
+    fused["ut_steering_ms"]  = _wavg(a.get("ut_steering_ms"), b.get("ut_steering_ms"), n_a, n_b)
+    fused["vt_steering_ms"]  = _wavg(a.get("vt_steering_ms"), b.get("vt_steering_ms"), n_a, n_b)
+    fused["n_cc"] = a.get("n_cc", 0) + b.get("n_cc", 0)
+    fused.pop("wt_99pct_ms", None)
+
+    return fused
+
+
+def _fuse_mcs_cores(a, b):
+    """
+    Merge two disjoint MCS (Level A) detections originating from the same
+    physical object, fragmented over one time step.
+
+    Unlike B/C, no 3D indices or raw per-voxel array are kept at Level A
+    (MCS footprints are too large for that). Per-z-level metrics
+    (``area_max_dz_km2``, ``width_max_km``, ...) therefore cannot be
+    recomputed exactly via mask reconstruction: they are approximated by the
+    extremum of the two fragments, means/medians by a ``n_voxels_3d``-
+    weighted average. ``wt_99pct_ms`` (a percentile, not reconstructible
+    without the raw array) is removed rather than kept wrong - same
+    principle as at Level B.
+    """
+    n_a = len(a.get("indices_2d", [])) or 1
+    n_b = len(b.get("indices_2d", [])) or 1
+    v_a = a.get("n_voxels_3d", 0) or 1
+    v_b = b.get("n_voxels_3d", 0) or 1
+
+    fused = dict(a)
+    fused["mcs_id_extra"] = _merge_extra_ids(a, b, "mcs_id")
+    fused["indices_2d"]  = _union_indices(a.get("indices_2d", []), b.get("indices_2d", []))
+    fused["area_2d_km2"] = a.get("area_2d_km2", 0.0) + b.get("area_2d_km2", 0.0)
+    fused["n_voxels_3d"] = a.get("n_voxels_3d", 0) + b.get("n_voxels_3d", 0)
+    fused["tb_min_k"]    = _vmin(a.get("tb_min_k"), b.get("tb_min_k"))
+    fused["tb_mean_k"]   = _wavg(a.get("tb_mean_k"), b.get("tb_mean_k"), n_a, n_b)
+    fused["pr_max_mmh"]  = _vmax(a.get("pr_max_mmh"), b.get("pr_max_mmh"))
+    fused["z_top_idx"]   = _vmax(a.get("z_top_idx"), b.get("z_top_idx"))
+    fused["z_base_idx"]  = _vmin(a.get("z_base_idx"), b.get("z_base_idx"))
+    fused["centroid_x"]  = _wavg(a.get("centroid_x"), b.get("centroid_x"), n_a, n_b)
+    fused["centroid_y"]  = _wavg(a.get("centroid_y"), b.get("centroid_y"), n_a, n_b)
+
+    fused["volume_km3"]      = a.get("volume_km3", 0.0) + b.get("volume_km3", 0.0)
+    fused["height_min_km"]   = _vmin(a.get("height_min_km"), b.get("height_min_km"))
+    fused["height_max_km"]   = _vmax(a.get("height_max_km"), b.get("height_max_km"))
+    fused["height_km"]       = _wavg(a.get("height_km"), b.get("height_km"), v_a, v_b)
+    fused["area_max_dz_km2"] = _vmax(a.get("area_max_dz_km2"), b.get("area_max_dz_km2"))
+    fused["area_mean_km2"]   = _wavg(a.get("area_mean_km2"), b.get("area_mean_km2"), v_a, v_b)
+    fused["area_median_km2"] = _wavg(a.get("area_median_km2"), b.get("area_median_km2"), v_a, v_b)
+    fused["width_max_km"]    = _vmax(a.get("width_max_km"), b.get("width_max_km"))
+    fused["width_mean_km"]   = _wavg(a.get("width_mean_km"), b.get("width_mean_km"), v_a, v_b)
+    fused["width_median_km"] = _wavg(a.get("width_median_km"), b.get("width_median_km"), v_a, v_b)
+    fused["wt_max_ms"]  = _vmax(a.get("wt_max_ms"), b.get("wt_max_ms"))
+    fused["wt_mean_ms"] = _wavg(a.get("wt_mean_ms"), b.get("wt_mean_ms"), v_a, v_b)
+    fused["ut_ms"] = _wavg(a.get("ut_ms"), b.get("ut_ms"), v_a, v_b)
+    fused["vt_ms"] = _wavg(a.get("vt_ms"), b.get("vt_ms"), v_a, v_b)
+    fused.pop("wt_99pct_ms", None)
+
+    return fused
+
+
+def _hms_to_seconds(hms):
+    """Parse a time string into seconds. Handles both 'HH:MM:SS' and ISO timestamps."""
+    hms = str(hms)
+    if "T" in hms:  # Format ISO (ex: "2024-01-01T00:05:00")
+        hms = hms.split("T")[-1].split(".")[0]  # Extrait "00:05:00"
+    h, m, s = map(int, hms.split(":"))
+    return h * 3600 + m * 60 + s
+
+
+def _collapse_transient_fragments(all_tracks, fuse_fn, max_fragment_span_s=120.0):
+    """
+    Retroactively merge fragments born from a split that is reabsorbed by
+    their own parent, provided the fragment's own lifetime fits within
+    ``max_fragment_span_s``.
+
+    The dataset's time steps are not uniform here (e.g. bursts of a few fine
+    30s/60s steps separated by a much larger gap, ~780s in CADDIWAF7): a
+    fragment observed only within one such burst (its own history spans at
+    most ``max_fragment_span_s``) and that merges back into the very track it
+    split from corresponds to a transient segmentation fragmentation (e.g. an
+    unstable watershed for that burst) rather than a real physical
+    split/merge - regardless of whether it was observed once or several
+    times within that burst. A fragment that instead survives across a
+    burst-to-burst gap before remerging is kept as a genuine split (its own
+    span exceeds ``max_fragment_span_s``).
+
+    Each of the fragment's history entries is recombined, via ``fuse_fn``
+    (specific to level A/B/C), into the parent's own entry for the matching
+    time step - instead of being silently lost. The fragment's track is then
+    deleted and the corresponding split/absorbed events are removed from the
+    parent, replaced by a single ``"transient_fragment"`` event. The parent
+    keeps its unique ``track_id`` throughout the whole sequence.
+    """
+    to_collapse = []
+    for tid, tr in all_tracks.items():
+        parent_id = tr.get("parent_id")
+        history   = tr.get("history", [])
+        if parent_id is None or not history or parent_id not in all_tracks:
+            continue
+        span_s = (_hms_to_seconds(history[-1]["time_value"])
+                 - _hms_to_seconds(history[0]["time_value"]))
+        if span_s > max_fragment_span_s:
+            continue
+        merge_events = [e for e in tr.get("events", []) if e.get("type") == "merge"]
+        if len(merge_events) != 1 or merge_events[0].get("into") != parent_id:
+            continue
+        to_collapse.append((tid, parent_id, history, tr.get("start_time")))
+
+    for tid, parent_id, frag_history, frag_start_time in to_collapse:
+        parent = all_tracks[parent_id]
+        for frag_entry in frag_history:
+            frag_time_value = frag_entry.get("time_value")
+            for i, h in enumerate(parent["history"]):
+                if h.get("time_value") == frag_time_value:
+                    parent["history"][i] = fuse_fn(h, frag_entry)
+                    break
+
+        parent["events"] = [
+            e for e in parent.get("events", [])
+            if not (e.get("type") == "split"    and e.get("child_id") == tid)
+            and not (e.get("type") == "absorbed" and e.get("from")     == tid)
+        ]
+        parent["events"].append(
+            {"type": "transient_fragment", "time": frag_start_time}
+        )
+        del all_tracks[tid]
+
+    return all_tracks
+
+
+def _count_common_sorted(sorted_a, sorted_b):
+    """
+    Number of elements common to two sorted, unique int64 arrays.
+
+    Equivalent to ``len(np.intersect1d(sorted_a, sorted_b, assume_unique=True))``
+    but avoids re-sorting either array (``np.intersect1d`` always sorts both
+    of its inputs internally, even when they're already sorted) - a real cost
+    here since the matching loops call this for every (track, item) pair with
+    the same ``shifted_keys``/``ci["keys"]`` arrays reused across many pairs.
+    """
+    if sorted_a.size == 0 or sorted_b.size == 0:
+        return 0
+    insert_at = np.searchsorted(sorted_a, sorted_b).clip(max=sorted_a.size - 1)
+    return int(np.count_nonzero(sorted_a[insert_at] == sorted_b))
+
+
 def _iou(keys_a, keys_b):
-    """IoU 3D entre deux ensembles de clés voxels (numpy int64)."""
-    n_inter = len(np.intersect1d(keys_a, keys_b, assume_unique=True))
-    n_union = len(keys_a) + len(keys_b) - n_inter
+    """3D IoU between two sets of voxel keys (numpy int64, already sorted - see ``_pack_indices``)."""
+    n_inter = _count_common_sorted(keys_a, keys_b)
+    n_union = keys_a.size + keys_b.size - n_inter
     return n_inter / n_union if n_union > 0 else 0.0
 
 
 def _iou_2d(keys_a, keys_b):
-    """IoU 2D entre deux ensembles de clés footprint (numpy int64)."""
-    n_inter = len(np.intersect1d(keys_a, keys_b, assume_unique=True))
-    n_union = len(keys_a) + len(keys_b) - n_inter
+    """2D IoU between two sets of footprint keys (numpy int64, already sorted - see ``_pack_indices_2d``)."""
+    n_inter = _count_common_sorted(keys_a, keys_b)
+    n_union = keys_a.size + keys_b.size - n_inter
     return n_inter / n_union if n_union > 0 else 0.0
 
 
 # ================================================================
-# TRACKING — NIVEAU C (cœurs convectifs)
+# TRACKING - LEVEL C (Convective Cores - CC)
 # ================================================================
 
 def _core_features(core):
     """
-    Vecteur de features [7] pour la similarité morphologique des cœurs.
-    Toutes les valeurs sont positives ; la similarité est calculée par ratio min/max
-    (invariante à l'échelle).
+    Feature vector [7] for the morphological similarity of cores.
+    All values are positive; similarity is computed via min/max ratio
+    (scale-invariant).
     """
     wt_arr = np.array(core.get("wt_3d_values", [0.0]), dtype=np.float32)
     return np.array([
-        core.get("area_max_dz",  0.0),
-        core.get("volume",       0.0),
-        core.get("speed_99pct",  core.get("max_speed", 0.0)),
-        core.get("iwp_mean",     0.0),
-        core.get("mrg_mean",     0.0),
+        core.get("area_max_dz_km2", 0.0),
+        core.get("volume_km3",      0.0),
+        core.get("wt_99pct_ms",     core.get("wt_max_ms", 0.0)),
+        core.get("iwp_mean",        0.0),
+        core.get("mrg_mean",        0.0),
         float(np.percentile(wt_arr, 50)),
         float(np.percentile(wt_arr, 75)),
     ], dtype=np.float32)
 
 
-# Poids par feature (même ordre que _core_features) :
-#   area_max_dz  volume  speed_99pct  iwp_mean  mrg_mean  wt_p50  wt_p75
+# Per-feature weights (same order as _core_features):
+#   area_max_dz_km2  volume_km3  wt_99pct_ms  iwp_mean  mrg_mean  wt_p50  wt_p75
 _FEAT_WEIGHTS        = np.array([1.0, 1.0, 1.5, 2.0, 0.5, 2.0, 1.5], dtype=np.float32)
 _FEAT_WEIGHTS       /= _FEAT_WEIGHTS.sum()
 
 
 def _morph_sim(feat_a, feat_b):
-    """Similarité pondérée [0, 1] entre deux vecteurs de features (ratio min/max)."""
+    """Weighted similarity [0, 1] between two feature vectors (min/max ratio)."""
     mx    = np.maximum(feat_a, feat_b)
     valid = mx > 1e-9
     if not valid.any():
@@ -1083,63 +1514,59 @@ def _morph_sim(feat_a, feat_b):
     return float((ratios * w).sum() / w_sum) if w_sum > 0 else 0.5
 
 
-def track_convective_cores(
+def track_cc(
     results_by_time,
     min_overlap=0.1,
-    patience=0,
+    patience=1,
     dx_meters=DX_METERS,
-    pre_filter_pixels=30,
     w_overlap=0.6,
     w_morph=0.4,
-    gap_bridge_seconds=120.0,
-    gap_bridge_max_dist_pixels=10,
-    advection_error_ms=5.0,
-    shape_buffer_pixels=3,
+    min_iou=0.02,
     feat_ema_alpha=0.7,
+    max_fragment_span_s=120.0,
 ):
     """
-    Tracking des cœurs convectifs (Niveau C) par IoU 3D advecté + algorithme hongrois.
+    Tracking of convective cores (Level C) via advected 3D IoU + Hungarian algorithm.
 
-    Stratégie par pas de temps :
-      1. Décaler les voxels du track par advection (u_steering * dt, v_steering * dt).
-      2. Calculer l'IoU 3D entre voxels advectés et voxels détectés à T+1.
-      3. Combiner avec la similarité morphologique (EMA sur l'historique du track).
-      4. Appariement optimal via algorithme hongrois.
-      5. Détecter splits et merges sur les scores résiduels.
+    Per-time-step strategy:
+      1. Shift the track's voxels by advection (u_steering * dt, v_steering * dt).
+      2. Compute the 3D IoU between advected voxels and voxels detected at T+1.
+      3. Filter out candidates with IoU < min_iou (no geometric distance filter).
+      4. Combine with morphological similarity (EMA over the track's history).
+      5. Optimal assignment via the Hungarian algorithm.
+      6. Detect splits and merges from the residual scores.
 
     Parameters
     ----------
     results_by_time : list of dict
-        Sortie de ``find_convective_cores_3d`` concaténée sur plusieurs pas de temps.
+        Output of ``find_convective_cores_3d`` concatenated over several time steps.
     min_overlap : float
-        Score composite minimum pour valider un appariement.
+        Minimum composite score to validate a match.
     patience : int
-        Nombre de pas de temps sans observation avant suppression de la trace.
+        Number of time steps without an observation before the track is dropped.
     dx_meters : float
-        Résolution de la grille (m/pixel).
-    pre_filter_pixels : int
-        Cap absolu du résidu centroïde après advection (pixels).
+        Grid resolution (m/pixel).
     w_overlap, w_morph : float
-        Poids de l'IoU 3D et de la similarité morphologique dans le score composite.
-    gap_bridge_seconds : float
-        Durée minimale d'un gap pour activer le bridge morphologique sans overlap.
-    gap_bridge_max_dist_pixels : int
-        Rayon centroïde max pour le bridge inter-bloc (pixels).
-    advection_error_ms : float
-        Erreur typique du vent steering (m/s) — détermine la limite adaptative
-        du filtre de résidu : limit = min(pre_filter_pixels, err*dt/dx + shape_buffer).
-    shape_buffer_pixels : int
-        Marge pour le changement de forme + erreur sub-pixel (pixels).
+        Weights of the 3D IoU and morphological similarity in the composite score.
+    min_iou : float
+        Minimum advected 3D IoU for a candidate to enter the score matrix.
+        Replaces the geometric centroid-distance filter.
     feat_ema_alpha : float
-        Coefficient de mémoire de l'EMA des features (0 = pas de mémoire, 1 = figée).
+        Memory coefficient of the feature EMA (0 = no memory, 1 = frozen).
+    max_fragment_span_s : float
+        Maximum lifetime (s) of a split-off fragment, measured over its own
+        history, for it to be collapsed back into its parent as a transient
+        segmentation artifact (see ``_collapse_transient_fragments``). A
+        fragment that survives longer than this before remerging into its
+        own parent is kept as a genuine split.
 
     Returns
     -------
     dict
-        Clés : identifiants de trace (``"Track_XXXX"``).
-        Valeurs : dict avec ``"track_id"``, ``"start_time"``, ``"end_time"``,
-        ``"duration_minutes"``, ``"history"`` (list de snapshots core),
-        et optionnellement ``"events"`` (splits/merges) et ``"parent_id"``.
+        Keys: track identifiers (``"Track_XXXX"``).
+        Values: dict with ``"track_id"``, ``"start_time"``, ``"end_time"``,
+        ``"duration_minutes"``, ``"history"`` (list of core snapshots), and
+        optionally ``"events"`` (splits/merges) and ``"parent_id"``.
     """
     all_tracks    = {}
     active_tracks = {}
@@ -1148,18 +1575,12 @@ def track_convective_cores(
     for t_idx, time_data in enumerate(results_by_time):
         time_val   = time_data["time"]
         current_ts = time_data.get("timestamp_s", t_idx * 30.0)
-        cores      = time_data["cores"]
+        cc_detections = time_data["cc"]
 
         core_items = []
-        for c in cores:
-            if "indices_2d" in c and c["indices_2d"]:
-                ys, xs = zip(*c["indices_2d"])
-                cy, cx = float(np.mean(ys)), float(np.mean(xs))
-            else:
-                zs, ys, xs = zip(*c["indices_3d"])
-                cy, cx = float(np.mean(ys)), float(np.mean(xs))
-            c["centroid_y"] = cy
-            c["centroid_x"] = cx
+        for c in cc_detections:
+            cy    = c["centroid_y"]
+            cx    = c["centroid_x"]
             idx3d = np.array(c["indices_3d"], dtype=np.int32)
             core_items.append({
                 "core": c,
@@ -1178,29 +1599,18 @@ def track_convective_cores(
             score_matrix = np.zeros((len(track_ids), len(core_items)), dtype=np.float32)
 
             for r, tid in enumerate(track_ids):
-                st      = active_tracks[tid]
-                dt      = current_ts - st["last_timestamp_s"]
-                u_pix   = st["u"] * dt / dx_meters
-                v_pix   = st["v"] * dt / dx_meters
-                pred_cy = st["cy"] + v_pix
-                pred_cx = st["cx"] + u_pix
+                st           = active_tracks[tid]
+                dt           = current_ts - st["last_timestamp_s"]
+                u_pix        = st["u"] * dt / dx_meters
+                v_pix        = st["v"] * dt / dx_meters
                 shifted_keys = _pack_indices(_advect_shift(st["idx3d"], u_pix, v_pix))
 
-                adaptive_limit    = min(pre_filter_pixels,
-                                        advection_error_ms * dt / dx_meters + shape_buffer_pixels)
-                adaptive_limit_sq = adaptive_limit ** 2
-
                 for c_idx, ci in enumerate(core_items):
-                    residual_sq = (ci["cy"] - pred_cy) ** 2 + (ci["cx"] - pred_cx) ** 2
-                    if residual_sq > adaptive_limit_sq:
+                    iou = _iou(shifted_keys, ci["keys"])
+                    if iou < min_iou:
                         continue
-                    iou   = _iou(shifted_keys, ci["keys"])
                     morph = _morph_sim(st["feat_ema"], ci["feat"])
-                    if iou > 0.0:
-                        score_matrix[r, c_idx] = w_overlap * iou + w_morph * morph
-                    elif dt > gap_bridge_seconds:
-                        if residual_sq <= gap_bridge_max_dist_pixels ** 2:
-                            score_matrix[r, c_idx] = w_morph * morph * 0.8
+                    score_matrix[r, c_idx] = w_overlap * iou + w_morph * morph
 
             row_ind, col_ind = linear_sum_assignment(1.0 - score_matrix)
             matched_col_to_row = {}
@@ -1211,7 +1621,6 @@ def track_convective_cores(
                 tid  = track_ids[r]
                 ci   = core_items[c_idx]
                 core = ci["core"]
-                loc  = core.get("localization", {})
                 matched_tracks.add(tid)
                 matched_cores.add(c_idx)
                 matched_col_to_row[c_idx] = r
@@ -1226,11 +1635,11 @@ def track_convective_cores(
                 st["last_feat"] = ci["feat"]
                 st["feat_ema"]  = (feat_ema_alpha * st["feat_ema"]
                                    + (1.0 - feat_ema_alpha) * ci["feat"])
-                st["u"] = loc.get("ut_steering", loc.get("ut", st["u"]))
-                st["v"] = loc.get("vt_steering", loc.get("vt", st["v"]))
+                st["u"] = core.get("ut_steering_ms", core.get("ut_ms", st["u"]))
+                st["v"] = core.get("vt_steering_ms", core.get("vt_ms", st["v"]))
                 all_tracks[tid]["history"].append(core)
 
-            # Merges : track non appariée qui overlap un cœur déjà pris → mort immédiate
+            # Merges: unmatched track that overlaps an already-taken core -> dies immediately
             for r, tid in enumerate(track_ids):
                 if tid in matched_tracks:
                     continue
@@ -1240,6 +1649,9 @@ def track_convective_cores(
                         all_tracks[tid].setdefault("events", []).append(
                             {"type": "merge", "time": time_val, "into": winner_tid}
                         )
+                        all_tracks[winner_tid].setdefault("events", []).append(
+                            {"type": "absorbed", "time": time_val, "from": tid}
+                        )
                         if tid in active_tracks:
                             all_tracks[tid]["end_time"]         = time_val
                             all_tracks[tid]["end_timestamp_s"]  = current_ts
@@ -1248,7 +1660,9 @@ def track_convective_cores(
                             del active_tracks[tid]
                         break
 
-            # Splits : cœur non apparié qui overlap un track déjà pris
+            # Splits: unmatched core that overlaps an already-taken track
+            # (the "split" event is created further below, in the "new
+            # cores" loop, once the child's ID is known - see child_id)
             split_children = {}
             for c_idx, ci in enumerate(core_items):
                 if c_idx in matched_cores:
@@ -1261,29 +1675,24 @@ def track_convective_cores(
                     if s >= min_overlap and s > best_score:
                         best_score, best_parent = s, tid
                 if best_parent is not None:
-                    all_tracks[best_parent].setdefault("events", []).append(
-                        {"type": "split", "time": time_val,
-                         "child_centroid": (ci["cy"], ci["cx"])}
-                    )
                     split_children[c_idx] = best_parent
 
-        # Nouveaux cœurs non appariés → nouvelles traces
+        # Unmatched new cores -> new tracks
         for c_idx, ci in enumerate(core_items):
             if c_idx in matched_cores:
                 continue
             track_counter += 1
-            tid  = f"Track_{track_counter:04d}"
+            tid  = f"CCTrack_{track_counter:04d}"
             core = ci["core"]
-            loc  = core.get("localization", {})
 
             parent_tid = split_children.get(c_idx)
             if parent_tid and parent_tid in active_tracks:
                 parent_st = active_tracks[parent_tid]
-                u_init = loc.get("ut_steering", loc.get("ut", parent_st["u"]))
-                v_init = loc.get("vt_steering", loc.get("vt", parent_st["v"]))
+                u_init = core.get("ut_steering_ms", core.get("ut_ms", parent_st["u"]))
+                v_init = core.get("vt_steering_ms", core.get("vt_ms", parent_st["v"]))
             else:
-                u_init = loc.get("ut_steering", loc.get("ut", 0.0))
-                v_init = loc.get("vt_steering", loc.get("vt", 0.0))
+                u_init = core.get("ut_steering_ms", core.get("ut_ms", 0.0))
+                v_init = core.get("vt_steering_ms", core.get("vt_ms", 0.0))
 
             track_data = {
                 "track_id":          tid,
@@ -1293,6 +1702,10 @@ def track_convective_cores(
             }
             if parent_tid:
                 track_data["parent_id"] = parent_tid
+                all_tracks[parent_tid].setdefault("events", []).append(
+                    {"type": "split", "time": time_val,
+                     "child_id": tid, "child_centroid": (ci["cy"], ci["cx"])}
+                )
             all_tracks[tid]    = track_data
             active_tracks[tid] = {
                 "last_time_idx":    t_idx,
@@ -1316,10 +1729,10 @@ def track_convective_cores(
                 "timestamp_s", st["last_timestamp_s"])
             all_tracks[tid]["duration_minutes"] = (
                 all_tracks[tid]["end_timestamp_s"]
-                - all_tracks[tid]["start_timestamp_s"]) / 60.0
+               - all_tracks[tid]["start_timestamp_s"]) / 60.0
             del active_tracks[tid]
 
-    # Finaliser les traces encore actives
+    # Finalize tracks that are still active
     for tid, st in active_tracks.items():
         last_idx = st["last_time_idx"]
         all_tracks[tid]["end_time"]         = results_by_time[last_idx]["time"]
@@ -1327,93 +1740,88 @@ def track_convective_cores(
             "timestamp_s", st["last_timestamp_s"])
         all_tracks[tid]["duration_minutes"] = (
             all_tracks[tid]["end_timestamp_s"]
-            - all_tracks[tid]["start_timestamp_s"]) / 60.0
+           - all_tracks[tid]["start_timestamp_s"]) / 60.0
 
-    return all_tracks
+    return _collapse_transient_fragments(all_tracks, _fuse_cc_cores, max_fragment_span_s)
 
 
 # ================================================================
-# TRACKING — NIVEAU B (objets convectifs)
+# TRACKING - LEVEL B (Convective Objects - UC)
 # ================================================================
 
-def _conv_obj_features(co):
-    """Vecteur de features [4] pour la similarité morphologique des objets convectifs."""
+def _uc_features(co):
+    """Feature vector [4] for the morphological similarity of convective objects."""
     return np.array([
         co.get("area_max_dz_km2", 0.0),
         co.get("volume_km3",      0.0),
         co.get("width_max_km",    0.0),
-        co.get("speed_99pct",     co.get("max_speed", 0.0)),
+        co.get("wt_99pct_ms",     co.get("wt_max_ms", 0.0)),
     ], dtype=np.float32)
 
 
-_CO_FEAT_WEIGHTS  = np.array([1.5, 1.0, 1.5, 2.0], dtype=np.float32)
-_CO_FEAT_WEIGHTS /= _CO_FEAT_WEIGHTS.sum()
+_UC_FEAT_WEIGHTS  = np.array([1.5, 1.0, 1.5, 2.0], dtype=np.float32)
+_UC_FEAT_WEIGHTS /= _UC_FEAT_WEIGHTS.sum()
 
 
-def _morph_sim_co(feat_a, feat_b):
-    """Similarité morphologique pondérée pour les objets convectifs."""
+def _morph_sim_uc(feat_a, feat_b):
+    """Weighted morphological similarity for convective objects."""
     mx    = np.maximum(feat_a, feat_b)
     valid = mx > 1e-9
     if not valid.any():
         return 0.5
     safe_mx = np.where(valid, mx, 1.0)
     ratios  = np.where(valid, np.minimum(feat_a, feat_b) / safe_mx, 1.0)
-    w       = np.where(valid, _CO_FEAT_WEIGHTS, 0.0)
+    w       = np.where(valid, _UC_FEAT_WEIGHTS, 0.0)
     w_sum   = w.sum()
     return float((ratios * w).sum() / w_sum) if w_sum > 0 else 0.5
 
 
-def track_conv_objects(
+def track_uc(
     results_by_time,
     min_overlap=0.1,
     patience=2,
     dx_meters=DX_METERS,
-    pre_filter_pixels=60,
     w_overlap=0.7,
     w_morph=0.3,
-    advection_error_ms=5.0,
-    shape_buffer_pixels=5,
-    gap_bridge_seconds=120.0,
-    gap_bridge_max_dist_pixels=20,
+    min_iou=0.05,
     feat_ema_alpha=0.7,
+    max_fragment_span_s=120.0,
 ):
     """
-    Tracking des objets convectifs (Niveau B) par IoU 3D advecté + algorithme hongrois.
+    Tracking of convective objects (Level B) via advected 3D IoU + Hungarian algorithm.
 
-    Même logique que ``track_convective_cores`` (Niveau C), sans détection de
-    splits/merges. Patience plus élevée (2 vs 0) : les objets convectifs sont plus
-    stables et peuvent temporairement sortir du masque WT sans disparaître physiquement.
+    Same logic as ``track_cc`` (Level C), including full split/merge/absorbed
+    detection. Patience is higher than at Level C (2 vs 1): convective
+    objects are more stable and can temporarily fall outside the WT mask
+    without physically disappearing.
 
     Parameters
     ----------
     results_by_time : list of dict
-        Sortie de ``find_convective_cores_3d`` concaténée sur plusieurs pas de temps.
+        Output of ``find_convective_cores_3d`` concatenated over several time steps.
     min_overlap : float
-        Score composite minimum pour valider un appariement.
+        Minimum composite score to validate a match.
     patience : int
-        Nombre de pas de temps sans observation avant suppression de la trace.
+        Number of time steps without an observation before the track is dropped.
     dx_meters : float
-        Résolution de la grille (m/pixel).
-    pre_filter_pixels : int
-        Cap absolu du résidu centroïde après advection (pixels).
+        Grid resolution (m/pixel).
     w_overlap, w_morph : float
-        Poids de l'IoU 3D et de la similarité morphologique.
-    advection_error_ms : float
-        Erreur typique du vent steering (m/s).
-    shape_buffer_pixels : int
-        Marge pour le changement de forme + erreur sub-pixel (pixels).
-    gap_bridge_seconds : float
-        Durée minimale d'un gap pour activer le bridge morphologique.
-    gap_bridge_max_dist_pixels : int
-        Rayon centroïde max pour le bridge inter-bloc (pixels).
+        Weights of the 3D IoU and morphological similarity.
+    min_iou : float
+        Minimum advected 3D IoU for a candidate to enter the score matrix.
+        Replaces the geometric centroid-distance filter.
     feat_ema_alpha : float
-        Coefficient de mémoire de l'EMA des features.
+        Memory coefficient of the feature EMA.
+    max_fragment_span_s : float
+        Maximum lifetime (s) of a split-off fragment for it to be collapsed
+        back into its parent as a transient segmentation artifact - see
+        ``track_cc`` / ``_collapse_transient_fragments``.
 
     Returns
     -------
     dict
-        Clés : identifiants de trace (``"COTrack_XXXX"``).
-        Valeurs : dict avec ``"track_id"``, ``"start_time"``, ``"end_time"``,
+        Keys: track identifiers (``"UCTrack_XXXX"``).
+        Values: dict with ``"track_id"``, ``"start_time"``, ``"end_time"``,
         ``"duration_minutes"``, ``"history"``.
     """
     all_tracks    = {}
@@ -1423,10 +1831,10 @@ def track_conv_objects(
     for t_idx, time_data in enumerate(results_by_time):
         time_val   = time_data["time"]
         current_ts = time_data.get("timestamp_s", t_idx * 30.0)
-        conv_objs  = time_data.get("conv_objects", [])
+        uc_detections = time_data.get("uc", [])
 
         items = []
-        for co in conv_objs:
+        for co in uc_detections:
             yx3d = co.get("indices_3d", [])
             if not yx3d:
                 continue
@@ -1437,40 +1845,31 @@ def track_conv_objects(
                 "cx":    co["centroid_x"],
                 "idx3d": idx3d,
                 "keys":  _pack_indices(idx3d),
-                "feat":  _conv_obj_features(co),
+                "feat":  _uc_features(co),
             })
 
-        matched_tracks = set()
-        matched_items  = set()
+        matched_tracks     = set()
+        matched_items      = set()
+        matched_col_to_row = {}
+        split_children     = {}
 
         if active_tracks and items:
             track_ids    = list(active_tracks.keys())
             score_matrix = np.zeros((len(track_ids), len(items)), dtype=np.float32)
 
             for r, tid in enumerate(track_ids):
-                st    = active_tracks[tid]
-                dt    = current_ts - st["last_timestamp_s"]
-                u_pix = st["u"] * dt / dx_meters
-                v_pix = st["v"] * dt / dx_meters
-                pred_cy = st["cy"] + v_pix
-                pred_cx = st["cx"] + u_pix
-
-                adaptive_limit    = min(pre_filter_pixels,
-                                        advection_error_ms * dt / dx_meters + shape_buffer_pixels)
-                adaptive_limit_sq = adaptive_limit ** 2
-                shifted_keys      = _pack_indices(_advect_shift(st["idx3d"], u_pix, v_pix))
+                st           = active_tracks[tid]
+                dt           = current_ts - st["last_timestamp_s"]
+                u_pix        = st["u"] * dt / dx_meters
+                v_pix        = st["v"] * dt / dx_meters
+                shifted_keys = _pack_indices(_advect_shift(st["idx3d"], u_pix, v_pix))
 
                 for c_idx, ci in enumerate(items):
-                    residual_sq = (ci["cy"] - pred_cy) ** 2 + (ci["cx"] - pred_cx) ** 2
-                    if residual_sq > adaptive_limit_sq:
+                    iou = _iou(shifted_keys, ci["keys"])
+                    if iou < min_iou:
                         continue
-                    iou   = _iou(shifted_keys, ci["keys"])
-                    morph = _morph_sim_co(st["feat_ema"], ci["feat"])
-                    if iou > 0.0:
-                        score_matrix[r, c_idx] = w_overlap * iou + w_morph * morph
-                    elif dt > gap_bridge_seconds:
-                        if residual_sq <= gap_bridge_max_dist_pixels ** 2:
-                            score_matrix[r, c_idx] = w_morph * morph * 0.8
+                    morph = _morph_sim_uc(st["feat_ema"], ci["feat"])
+                    score_matrix[r, c_idx] = w_overlap * iou + w_morph * morph
 
             row_ind, col_ind = linear_sum_assignment(1.0 - score_matrix)
             for r, c_idx in zip(row_ind, col_ind):
@@ -1481,6 +1880,7 @@ def track_conv_objects(
                 co  = ci["co"]
                 matched_tracks.add(tid)
                 matched_items.add(c_idx)
+                matched_col_to_row[c_idx] = r
 
                 st = active_tracks[tid]
                 st["last_time_idx"]    = t_idx
@@ -1490,22 +1890,66 @@ def track_conv_objects(
                 st["idx3d"]   = ci["idx3d"]
                 st["feat_ema"] = (feat_ema_alpha * st["feat_ema"]
                                   + (1.0 - feat_ema_alpha) * ci["feat"])
-                st["u"] = co.get("ut_steering", co.get("ut_mean", st["u"]))
-                st["v"] = co.get("vt_steering", co.get("vt_mean", st["v"]))
+                st["u"] = co.get("ut_steering_ms", co.get("ut_ms", st["u"]))
+                st["v"] = co.get("vt_steering_ms", co.get("vt_ms", st["v"]))
                 all_tracks[tid]["history"].append(co)
+
+            # Merges: unmatched track that overlaps an already-taken UC -> dies immediately
+            for r, tid in enumerate(track_ids):
+                if tid in matched_tracks:
+                    continue
+                for c_idx in matched_items:
+                    if score_matrix[r, c_idx] >= min_overlap:
+                        winner_tid = track_ids[matched_col_to_row[c_idx]]
+                        all_tracks[tid].setdefault("events", []).append(
+                            {"type": "merge", "time": time_val, "into": winner_tid}
+                        )
+                        all_tracks[winner_tid].setdefault("events", []).append(
+                            {"type": "absorbed", "time": time_val, "from": tid}
+                        )
+                        if tid in active_tracks:
+                            all_tracks[tid]["end_time"]         = time_val
+                            all_tracks[tid]["end_timestamp_s"]  = current_ts
+                            all_tracks[tid]["duration_minutes"] = (
+                                current_ts - all_tracks[tid]["start_timestamp_s"]) / 60.0
+                            del active_tracks[tid]
+                        break
+
+            # Splits: unmatched UC that overlaps an already-taken track
+            # (the "split" event is created further below, once the child's ID is known)
+            for c_idx, ci in enumerate(items):
+                if c_idx in matched_items:
+                    continue
+                best_score, best_parent = -1.0, None
+                for r, tid in enumerate(track_ids):
+                    if tid not in matched_tracks:
+                        continue
+                    s = score_matrix[r, c_idx]
+                    if s >= min_overlap and s > best_score:
+                        best_score, best_parent = s, tid
+                if best_parent is not None:
+                    split_children[c_idx] = best_parent
 
         for c_idx, ci in enumerate(items):
             if c_idx in matched_items:
                 continue
             track_counter += 1
-            tid = f"COTrack_{track_counter:04d}"
-            co  = ci["co"]
-            all_tracks[tid] = {
+            tid        = f"UCTrack_{track_counter:04d}"
+            co         = ci["co"]
+            parent_tid = split_children.get(c_idx)
+            track_data = {
                 "track_id":          tid,
                 "start_time":        time_val,
                 "start_timestamp_s": current_ts,
                 "history":           [co],
             }
+            if parent_tid:
+                track_data["parent_id"] = parent_tid
+                all_tracks[parent_tid].setdefault("events", []).append(
+                    {"type": "split", "time": time_val,
+                     "child_id": tid, "child_centroid": (ci["cy"], ci["cx"])}
+                )
+            all_tracks[tid] = track_data
             active_tracks[tid] = {
                 "last_time_idx":    t_idx,
                 "last_timestamp_s": current_ts,
@@ -1513,12 +1957,13 @@ def track_conv_objects(
                 "cx":      ci["cx"],
                 "idx3d":   ci["idx3d"],
                 "feat_ema": ci["feat"].copy(),
-                "u": co.get("ut_steering", co.get("ut_mean", 0.0)),
-                "v": co.get("vt_steering", co.get("vt_mean", 0.0)),
+                "u": co.get("ut_steering_ms", co.get("ut_ms", 0.0)),
+                "v": co.get("vt_steering_ms", co.get("vt_ms", 0.0)),
+                "patience": 0 if parent_tid else patience,
             }
 
         dead = [tid for tid, st in active_tracks.items()
-                if t_idx - st["last_time_idx"] > patience]
+                if t_idx - st["last_time_idx"] > st.get("patience", patience)]
         for tid in dead:
             st       = active_tracks[tid]
             last_idx = st["last_time_idx"]
@@ -1527,7 +1972,7 @@ def track_conv_objects(
                 "timestamp_s", st["last_timestamp_s"])
             all_tracks[tid]["duration_minutes"] = (
                 all_tracks[tid]["end_timestamp_s"]
-                - all_tracks[tid]["start_timestamp_s"]) / 60.0
+               - all_tracks[tid]["start_timestamp_s"]) / 60.0
             del active_tracks[tid]
 
     for tid, st in active_tracks.items():
@@ -1537,54 +1982,70 @@ def track_conv_objects(
             "timestamp_s", st["last_timestamp_s"])
         all_tracks[tid]["duration_minutes"] = (
             all_tracks[tid]["end_timestamp_s"]
-            - all_tracks[tid]["start_timestamp_s"]) / 60.0
+           - all_tracks[tid]["start_timestamp_s"]) / 60.0
 
-    return all_tracks
+    return _collapse_transient_fragments(all_tracks, _fuse_uc_cores, max_fragment_span_s)
 
 
 # ================================================================
-# TRACKING — NIVEAU A (MCS)
+# TRACKING - LEVEL A (MCS)
 # ================================================================
 
 def track_mcs(
     results_by_time,
     min_iou=0.05,
     patience=4,
-    max_speed_ms=30.0,
+    mcs_min_area_bt_km2=10000.0,
+    mcs_bt_overshoot_k=225.0,
+    mcs_pr_max_mmh=10.0,
+    mcs_min_duration_minutes=30.0,
+    max_fragment_span_s=120.0,
 ):
     """
-    Tracking des MCS (Niveau A) par IoU 2D advecté + algorithme hongrois.
+    Tracking of MCSs (Level A) via advected 2D IoU + Hungarian algorithm.
 
-    Le footprint de chaque track est décalé par son vent steering
-    (``ut_steering``, ``vt_steering`` stockés dans le dict MCS) avant le
-    calcul de l'IoU. Un appariement est rejeté si la vitesse de déplacement
-    du centroïde dépasse ``max_speed_ms`` (contrainte physique).
+    Each track's footprint is shifted by its steering wind (``ut_steering``,
+    ``vt_steering`` stored in the MCS dict) before computing the 2D IoU.
 
-    Splits et merges sont détectés et enregistrés dans ``"events"`` :
-    - Split  : un MCS donne naissance à plusieurs enfants. La track parent se
-               termine au moment du split ; chaque enfant hérite ``"parent_id"``.
-    - Merge  : plusieurs MCS convergent en un seul. Les tracks absorbées se
-               terminent immédiatement avec un event ``"merge"``.
+    Splits and merges are detected and recorded in ``"events"``:
+   - Split : an MCS gives rise to several children. The parent track keeps
+              its own ``track_id`` and continues under the branch the
+              Hungarian assignment matches it to; each child inherits
+              ``"parent_id"``.
+   - Merge : several MCSs converge into one. The absorbed tracks end
+              immediately with a ``"merge"`` event.
 
     Parameters
     ----------
     results_by_time : list of dict
-        Sortie de ``find_convective_cores_3d`` concaténée sur plusieurs pas de temps.
+        Output of ``find_convective_cores_3d`` concatenated over several time steps.
     min_iou : float
-        IoU 2D minimum pour valider un appariement.
+        Minimum 2D IoU to validate a match.
     patience : int
-        Nombre de pas de temps sans observation avant suppression de la trace.
-    max_speed_ms : float
-        Vitesse maximale physique du centroïde MCS (m/s). Tout appariement
-        impliquant une vitesse supérieure est rejeté (score forcé à 0).
+        Number of time steps without an observation before the track is dropped.
+    mcs_min_area_bt_km2 : float or None
+        Maximum Tb shield area over the track's lifetime (km2).
+        None to disable this criterion.
+    mcs_bt_overshoot_k : float or None
+        Cold overshoot threshold: min(tb_min_k) over the track must be <= this
+        value (K). None to disable.
+    mcs_pr_max_mmh : float or None
+        Maximum precipitation under the shield over the track (mm/h). None to
+        disable, or if INPRR is absent from the dataset.
+    max_fragment_span_s : float
+        Maximum lifetime (s) of a split-off fragment for it to be collapsed
+        back into its parent as a transient segmentation artifact - see
+        ``track_cc`` / ``_collapse_transient_fragments``.
 
     Returns
     -------
     dict
-        Clés : identifiants de trace (``"MCSTrack_XXXX"``).
-        Valeurs : dict avec ``"track_id"``, ``"start_time"``, ``"end_time"``,
-        ``"duration_minutes"``, ``"history"``,
-        et optionnellement ``"events"`` et ``"parent_id"``.
+        Keys: track identifiers (``"MCSTrack_XXXX"``).
+        Values: dict with ``"track_id"``, ``"start_time"``, ``"end_time"``,
+        ``"duration_minutes"``, ``"history"``, and optionally ``"events"``
+        and ``"parent_id"``.
+        Only tracks whose peak validates the MOAAP criteria are returned;
+        each track keeps all of its time steps (genesis + maturity + decay).
     """
     all_tracks    = {}
     active_tracks = {}
@@ -1624,20 +2085,12 @@ def track_mcs(
                 if dt <= 0:
                     dt = 30.0
 
-                # Advection du footprint et du centroïde de la track
+                # Footprint advection
                 u_pix    = st["u"] * dt / DX_METERS
                 v_pix    = st["v"] * dt / DX_METERS
                 adv_keys = _advect_shift_2d(st["keys"], u_pix, v_pix)
-                adv_cx   = st["cx"] + u_pix
-                adv_cy   = st["cy"] + v_pix
-
-                # Distance résiduelle max depuis le centroïde advecté
-                max_dist_px = max_speed_ms * dt / DX_METERS
 
                 for c_idx, ci in enumerate(items):
-                    dist_px = np.hypot(ci["cx"] - adv_cx, ci["cy"] - adv_cy)
-                    if dist_px > max_dist_px:
-                        continue
                     score_matrix[r, c_idx] = _iou_2d(adv_keys, ci["keys"])
 
             row_ind, col_ind = linear_sum_assignment(1.0 - score_matrix)
@@ -1660,7 +2113,7 @@ def track_mcs(
                 st["keys"] = ci["keys"]
                 all_tracks[tid]["history"].append(ci["mcs"])
 
-            # Merges : track non appariée qui overlap un MCS déjà pris → mort immédiate
+            # Merges: unmatched track that overlaps an already-taken MCS -> dies immediately
             for r, tid in enumerate(track_ids):
                 if tid in matched_tracks:
                     continue
@@ -1670,6 +2123,9 @@ def track_mcs(
                         all_tracks[tid].setdefault("events", []).append(
                             {"type": "merge", "time": time_val, "into": winner_tid}
                         )
+                        all_tracks[winner_tid].setdefault("events", []).append(
+                            {"type": "absorbed", "time": time_val, "from": tid}
+                        )
                         if tid in active_tracks:
                             all_tracks[tid]["end_time"]         = time_val
                             all_tracks[tid]["end_timestamp_s"]  = current_ts
@@ -1678,7 +2134,8 @@ def track_mcs(
                             del active_tracks[tid]
                         break
 
-            # Splits : MCS non apparié qui overlap une track déjà prise
+            # Splits: unmatched MCS that overlaps an already-taken track
+            # (the "split" event is created further below, once the child's ID is known)
             for c_idx, ci in enumerate(items):
                 if c_idx in matched_items:
                     continue
@@ -1690,13 +2147,9 @@ def track_mcs(
                     if s >= min_iou and s > best_score:
                         best_score, best_parent = s, tid
                 if best_parent is not None:
-                    all_tracks[best_parent].setdefault("events", []).append(
-                        {"type": "split", "time": time_val,
-                         "child_centroid": (ci["cy"], ci["cx"])}
-                    )
                     split_children[c_idx] = best_parent
 
-        # Nouveaux MCS non appariés → nouvelles traces
+        # Unmatched new MCSs -> new tracks
         for c_idx, ci in enumerate(items):
             if c_idx in matched_items:
                 continue
@@ -1713,6 +2166,10 @@ def track_mcs(
             parent_tid = split_children.get(c_idx)
             if parent_tid:
                 track_data["parent_id"] = parent_tid
+                all_tracks[parent_tid].setdefault("events", []).append(
+                    {"type": "split", "time": time_val,
+                     "child_id": tid, "child_centroid": (ci["cy"], ci["cx"])}
+                )
 
             all_tracks[tid] = track_data
             active_tracks[tid] = {
@@ -1733,7 +2190,7 @@ def track_mcs(
                 "timestamp_s", st["last_timestamp_s"])
             all_tracks[tid]["duration_minutes"] = (
                 all_tracks[tid]["end_timestamp_s"]
-                - all_tracks[tid]["start_timestamp_s"]) / 60.0
+               - all_tracks[tid]["start_timestamp_s"]) / 60.0
             del active_tracks[tid]
 
     for tid, st in active_tracks.items():
@@ -1743,6 +2200,29 @@ def track_mcs(
             "timestamp_s", st["last_timestamp_s"])
         all_tracks[tid]["duration_minutes"] = (
             all_tracks[tid]["end_timestamp_s"]
-            - all_tracks[tid]["start_timestamp_s"]) / 60.0
+           - all_tracks[tid]["start_timestamp_s"]) / 60.0
 
-    return all_tracks
+    all_tracks = _collapse_transient_fragments(all_tracks, _fuse_mcs_cores, max_fragment_span_s)
+
+    # A posteriori MOAAP qualification: keep only tracks whose peak validates
+    # the MCS criteria. The full track is kept (genesis + decay).
+    filtered = {}
+    for tid, tr in all_tracks.items():
+        hist = tr.get("history", [])
+        if not hist:
+            continue
+        peak_area = max(h.get("area_2d_km2", 0.0) for h in hist)
+        min_tb    = min(h.get("tb_min_k", 999.0) for h in hist)
+        pr_vals   = [h["pr_max_mmh"] for h in hist if h.get("pr_max_mmh") is not None]
+        peak_pr   = max(pr_vals) if pr_vals else None
+
+        duration  = tr.get("duration_minutes", 0.0)
+        area_ok   = mcs_min_area_bt_km2      is None or peak_area >= mcs_min_area_bt_km2
+        tb_ok     = mcs_bt_overshoot_k       is None or min_tb    <= mcs_bt_overshoot_k
+        pr_ok     = mcs_pr_max_mmh           is None or peak_pr   is None or peak_pr >= mcs_pr_max_mmh
+        dur_ok    = mcs_min_duration_minutes is None or duration  >= mcs_min_duration_minutes
+
+        if area_ok and tb_ok and pr_ok and dur_ok:
+            filtered[tid] = tr
+
+    return filtered

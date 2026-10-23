@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence
-
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from .functions import advect_indices, iou_from_sets, pack_indices
 
-FeatureFn = Callable[[Dict[str, Any]], np.ndarray]
-
+FeatureFn = None # Placeholder for a feature extraction function type
 DEFAULT_STEP_SECONDS = 30.0
 
 
@@ -24,24 +21,25 @@ class AdvectedIoUTracker:
     def __init__(
         self,
         track_prefix,
-        index_key                   = "indices_3d",
-        min_score                   = 0.1,
-        patience                    = 0,
-        dx_meters                   = 1000.0,
-        grid_size                   = 10000,
-        pre_filter_pixels           = 30.0,
-        advection_error_ms          = 5.0,
-        shape_buffer_pixels         = 3.0,
-        gap_bridge_seconds          = 120.0,
-        gap_bridge_max_dist_pixels  = 10.0,
-        feature_fn                  = None,
-        feature_weights              = None,
-        feat_ema_alpha               = 0.7,
-        w_overlap                    = 0.6,
-        w_morph                      = 0.4,
-        steering_fields: Sequence[str] = ("u_steering", "v_steering"),
-        max_speed_ms                 = None,
-        detect_splits_merges         = True,
+        index_key                       = "indices_3d",
+        min_score                       = 0.1,
+        patience                        = 0,
+        dx_meters                       = 1000.0,
+        grid_size                       = 10000,
+        pre_filter_pixels               = 30.0,
+        advection_error_ms              = 5.0,
+        shape_buffer_pixels             = 3.0,
+        gap_bridge_seconds              = 120.0,
+        gap_bridge_max_dist_pixels      = 10.0,
+        feature_fn                      = None,
+        feature_weights                 = None,
+        feat_ema_alpha                  = 0.7,
+        w_overlap                       = 0.6,
+        w_morph                         = 0.4,
+        min_iou                         = 0.0,
+        steering_fields                 = ("u_steering", "v_steering"),
+        max_speed_ms                    = None,
+        detect_splits_merges            = True,
     ):
         if feature_fn is not None and feature_weights is None:
             raise ValueError("feature_weights is required when feature_fn is provided")
@@ -67,10 +65,10 @@ class AdvectedIoUTracker:
         self.steering_fields             = steering_fields
         self.max_speed_ms                = max_speed_ms
         self.detect_splits_merges        = bool(detect_splits_merges)
-
-        self._all_tracks: Dict[str, Dict[str, Any]] = {}
-        self._active: Dict[str, Dict[str, Any]] = {}
-        self._counter = 0
+        self._all_tracks                 = {}
+        self._active                     = {}
+        self._counter                    = 0
+        self.min_iou                     = float(min_iou)
 
     def _morph_similarity(self, feat_a: np.ndarray, feat_b: np.ndarray):
         """Weighted mean of per-feature min/max ratios (0.5 when undefined)."""
@@ -130,7 +128,7 @@ class AdvectedIoUTracker:
                     continue
 
                 iou = iou_from_sets(shifted_keys, it["keys"])
-                if self.feature_fn is None:
+                if self.feature_fn is None or iou < self.min_iou:
                     scores[r, c] = iou
                     continue
 
@@ -200,8 +198,8 @@ class AdvectedIoUTracker:
         items = self._build_items(objects)
         current_ts = timestamp_s if timestamp_s is not None else time_index * DEFAULT_STEP_SECONDS
 
-        winner_by_item: Dict[int, str] = {}
-        split_parent_by_item: Dict[int, str] = {}
+        winner_by_item = {}
+        split_parent_by_item = {}
 
         if self._active and items:
             track_ids = list(self._active)
@@ -246,5 +244,5 @@ class AdvectedIoUTracker:
         for tid in [t for t, st in self._active.items() if time_index - st["last_time_index"] > self.patience]:
             del self._active[tid]
 
-    def finalize(self) -> Dict[str, Any]:
+    def finalize(self) :
         return self._all_tracks
