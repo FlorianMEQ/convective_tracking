@@ -1,56 +1,9 @@
-"""Non-regression comparison: old pipeline vs new pipeline.
-
-This script runs two variants on the same synthetic dataset (a single
-Gaussian/disk "convective cluster", over several timesteps):
-
-  1. "Old"  : ``src.old.fct_core_tracking.find_convective_cores_3d`` +
-     ``track_mcs`` / ``track_uc`` / ``track_cc``.
-
-  2. "New detection + legacy tracking" : the generic engine
-     (``src.tracking``) with the generic detector ``src.tracking.detection``
-     configured by the rules of ``examples.convective_rules`` (through
-     ``examples.convective_rules``), using both the legacy tracking functions
-     and the new ``AdvectedIoUTracker``.
-
-     This bridge isolates the question: "does the new detection produce the
-     same objects as the old one?" independently of the tracker. It also
-     compares the legacy trackers and ``AdvectedIoUTracker`` on the exact same
-     new detections, checking whether each object is linked to the same object
-     at the next timestep.
-
-Usage
------
-    # Synthetic dataset (default)
-    conda run -n mesonh python scripts/compare_legacy_new.py
-
-    # Real NetCDF file (e.g. MesoNH output), all timesteps
-    conda run -n mesonh python scripts/compare_legacy_new.py --netcdf /path/to/file.nc
-
-    # Limit the number of loaded timesteps (real files are often large)
-    conda run -n mesonh python scripts/compare_legacy_new.py --netcdf file.nc --max-steps 5 --start-step 10
-
-The script prints the object counts per timestep and per level for both
-pipelines, as well as the number of tracks obtained, and returns a non-zero
-exit code if a divergence is detected.
-
-Note: the ``mcs`` and ``convective_object`` rules now intentionally differ
-from the old algorithm: all objects are 3D, the MCS mask combines the
-hydrometeor content with the Tb envelope (instead of a Tb-only 2D watershed),
-and the hydrometeor condition moved from ``convective_object`` to ``mcs``.
-Divergences on these two levels are therefore expected and are not a
-regression.
-"""
-
 from __future__ import annotations
 
 from time import perf_counter
 import argparse
 import sys
 from pathlib import Path
-
-# Allow direct execution (`python scripts/compare_legacy_new.py`) in addition
-# to `python -m scripts.compare_legacy_new`: without this, only the scripts/
-# folder is added to sys.path and `examples`/`src` cannot be found.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -72,7 +25,6 @@ from src.old.fct_core_tracking import (
     track_mcs,
 )
 
-# --- Geometry of the synthetic dataset ---
 NJ = NI = 64
 NLEV = 100
 CENTER0 = (20, 20)  # (y, x) at timestep 0
@@ -419,7 +371,7 @@ def run_new_pipeline(datasets: list[xr.Dataset]) -> dict:
 
 def _footprint(obj, index_key):
     indices = obj.get(index_key, [])
-    if not indices:
+    if len(indices) == 0:
         return frozenset()
     return frozenset(tuple(idx) for idx in indices)
 

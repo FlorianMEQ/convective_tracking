@@ -125,11 +125,21 @@ def _layer_heights(context, rule):
         ),
     )
 
+def _slice_field(field, sl):
+    if field.ndim == 3:
+        return field[sl]
+    if field.ndim == 2:
+        return field[sl[1], sl[2]]
+    return field
 
-def _build_mask(context, rule, preloaded=None):
+def _build_mask(context, rule, preloaded=None, sl=None):
     if preloaded is None:
         preloaded = _preload_fields(context, rule)
-
+    if sl is not None:
+        preloaded = {
+            name: _slice_field(field, sl)
+            for name, field in preloaded.items()
+        }
     vertical_size = None
     for f in preloaded.values():
         if f.ndim == 3:
@@ -240,34 +250,6 @@ def _condition_threshold(rule, variable):
             return float(condition["value"])
     return 0.0
 
-
-def _recursive_split(
-    context, rule, variable, idx, dx_km, max_depth=3
-):
-    """Split one component by recursive H-maxima watershed on ``variable``."""
-    field = _required_field(context, rule, variable)
-    reference = _condition_threshold(rule, variable)
-
-    def compute_adaptive_h(values):
-        h = _SPLIT_H_SLOPE * (float(values.max()) - reference)
-        return float(min(max(h, _SPLIT_H_MIN), _SPLIT_H_MAX))
-
-    def stop_condition(mask):
-        return compute_component_metrics(mask, dx_km=dx_km)["width_median_km"] <= _SPLIT_MIN_WIDTH_KM
-
-    subgroups = recursive_watershed_segmentation(
-        idx,
-        field[tuple(idx.T)],
-        compute_adaptive_h=compute_adaptive_h,
-        stop_condition=stop_condition,
-        connectivity=_SPLIT_CONNECTIVITY,
-        merge_stacked=True,
-        stacked_seeds_xy_radius=_SPLIT_STACKED_SEEDS_RADIUS,
-        max_depth=max_depth,
-    )
-    return [np.array(group["indices"], dtype=np.int64) for group in subgroups]
-
-
 def _describe(idx, metrics):
     return {
         "area_km2": metrics["area_km2"],
@@ -277,7 +259,7 @@ def _describe(idx, metrics):
         "centroid_x": float(idx[:, 2].mean()),
         "centroid_y": float(idx[:, 1].mean()),
         "centroid_z": float(idx[:, 0].mean()),
-        "indices_3d": idx.tolist(),
+        "indices_3d": np.asarray(idx, dtype=np.int64),
     }
 
 def _preload_fields(context, rule):
@@ -298,40 +280,35 @@ def _preload_fields(context, rule):
     return preloaded
 
 
-def detect_objects(
-    context: DetectionContext, 
-    parent_object: Optional[Dict[str, Any]], 
-    level: TrackingLevel
-) -> List[Dict[str, Any]]:
+def detect_objects(context, parent_object, level):
     rule = level.params
-    ds = context.dataset
+    field = _cached(context, ("fields", level.name), lambda: _preload_fields(context, rule))
 
-    vertical_dim = rule.get("vertical_dim", "level")
-    z_idx = _vertical_indices(context, rule)
-    preloaded = {}
-    for condition in rule["conditions"]:
-        names = condition["variables"]
-        names = [names] if isinstance(names, str) else names
-        for name in names:
-            if name not in preloaded and name in ds:
-                if vertical_dim in ds[name].dims:
-                    preloaded[name] = ds[name].isel({vertical_dim: z_idx}).values.astype(np.float32)
-                else:
-                    preloaded[name] = ds[name].values.astype(np.float32)
+    if parent_object is None:
+        sl, origin, pidx = (slice(None),) * 3, np.zeros(3, dtype=np.int64), None
+    else:
+        pidx = np.asarray(parent_object["indices_3d"], dtype=np.int64)
+        origin = pidx.min(axis=0)
+        sl = tuple(slice(a, b) for a, b in zip(origin, pidx.max(axis=0) + 1))
 
-    mask = _build_mask(context, rule, preloaded)
-    if mask is None:
+    mask = _build_mask(context, rule, field, sl)
+    
+    if pidx is not None:
+        fp = np.zeros(mask.shape, dtype=bool)
+        fp[tuple((pidx - origin).T)] = True
+        mask &= fp
+    if not mask.any():
         return []
-    if parent_object is not None:
-        mask = _restrict_to_parent(mask, parent_object)
-    if mask is None or not mask.any():
-        return []
+    
+    labels, _ = connected_components_3d(mask, rule.get("connectivity") or 26)
+    groups = [g + origin for g in _label_groups(labels)]
+
     dx_km = float(rule.get("dx_km", 1.0))
     heights = _layer_heights(context, rule)
     split_variable = rule.get("split")
-    field = preloaded.get(split_variable) if split_variable else None
+
     labels, _ = connected_components_3d(mask, rule.get("connectivity") or 26)
-    groups = list(_label_groups(labels))
+    groups = [g + origin for g in _label_groups(labels)]
     objects = []
     for group in groups:
         if len(group) < rule.get("min_voxels", 0):
@@ -343,7 +320,7 @@ def detect_objects(
 
         if split_variable and field is not None:
             parts = _recursive_split_fast(
-                field,
+                field[split_variable],
                 rule,
                 split_variable,
                 group,
@@ -364,7 +341,6 @@ def detect_objects(
     return objects
 
 def _recursive_split_fast(field, rule, variable, idx, dx_km, reference, max_depth=1):
-    """Version ultra-rapide du split (sans context)."""
     if len(idx) == 0 or max_depth <= 0:
         return [idx]
 
@@ -391,3 +367,29 @@ def _recursive_split_fast(field, rule, variable, idx, dx_km, reference, max_dept
             parts.append(global_coords)
 
     return parts if parts else [idx]
+
+def _recursive_split(
+    context, rule, variable, idx, dx_km, max_depth=3
+):
+    """Split one component by recursive H-maxima watershed on ``variable``."""
+    field = _required_field(context, rule, variable)
+    reference = _condition_threshold(rule, variable)
+
+    def compute_adaptive_h(values):
+        h = _SPLIT_H_SLOPE * (float(values.max()) - reference)
+        return float(min(max(h, _SPLIT_H_MIN), _SPLIT_H_MAX))
+
+    def stop_condition(mask):
+        return compute_component_metrics(mask, dx_km=dx_km)["width_median_km"] <= _SPLIT_MIN_WIDTH_KM
+
+    subgroups = recursive_watershed_segmentation(
+        idx,
+        field[tuple(idx.T)],
+        compute_adaptive_h=compute_adaptive_h,
+        stop_condition=stop_condition,
+        connectivity=_SPLIT_CONNECTIVITY,
+        merge_stacked=True,
+        stacked_seeds_xy_radius=_SPLIT_STACKED_SEEDS_RADIUS,
+        max_depth=max_depth,
+    )
+    return [np.array(group["indices"], dtype=np.int64) for group in subgroups]

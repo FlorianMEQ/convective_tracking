@@ -1836,7 +1836,7 @@ def track_uc(
         items = []
         for co in uc_detections:
             yx3d = co.get("indices_3d", [])
-            if not yx3d:
+            if len(yx3d) == 0:
                 continue
             idx3d = np.array(yx3d, dtype=np.int32)
             items.append({

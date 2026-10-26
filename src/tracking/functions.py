@@ -92,10 +92,11 @@ def compute_component_metrics(
 
 
 def iou_from_sets(a, b):
-    """IoU between two arrays of unique integer keys."""
-    inter = len(np.intersect1d(a, b, assume_unique=False))
-    union = len(a) + len(b) - inter
-    return float(inter / union) if union > 0 else 0.0
+    if a.size == 0 or b.size == 0:
+        return 0.0
+    pos = np.searchsorted(a, b).clip(max=a.size - 1)
+    inter = int(np.count_nonzero(a[pos] == b))
+    return inter / (a.size + b.size - inter)
 
 
 def pack_indices(idx, grid_size=10000):
@@ -103,9 +104,13 @@ def pack_indices(idx, grid_size=10000):
         return np.array([], dtype=np.int64)
     idx = idx.astype(np.int64)
     if idx.shape[1] == 2:
-        return idx[:, 0] * grid_size + idx[:, 1]
+        keys = idx[:, 0] * grid_size + idx[:, 1]
+        keys.sort()
+        return keys
     elif idx.shape[1] == 3:
-        return idx[:, 0] * (grid_size ** 2) + idx[:, 1] * grid_size + idx[:, 2]
+        keys = idx[:, 0] * (grid_size ** 2) + idx[:, 1] * grid_size + idx[:, 2]
+        keys.sort()
+        return keys
     else:
         raise ValueError("pack_indices only supports 2 or 3 columns")
 
@@ -126,8 +131,7 @@ def merge_stacked_seeds(
 
     Two seeds are considered stacked if their projections along axis 0 overlap
     after a disk dilation of radius ``xy_radius``. The most intense seed
-    (highest value in ``field``) absorbs the others. Fully generic: works on
-    any 3D labeled marker array, independent of the physical meaning of axis 0.
+    (highest value in ``field``) absorbs the others.
     """
     labels = np.unique(markers)
     labels = labels[labels > 0]
@@ -172,7 +176,7 @@ def recursive_watershed_segmentation(
     _depth = 0,
     max_depth=3,
 ):
-    """Generic recursive H-maxima watershed segmentation of a labeled 3D point set.
+    """Recursive H-maxima watershed segmentation of a labeled 3D point set.
     Parameters
     ----------
     indices : ndarray (n, 3)

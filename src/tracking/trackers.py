@@ -83,8 +83,10 @@ class AdvectedIoUTracker:
         items = []
         u_key, v_key = self.steering_fields
         for obj in objects:
-            if not obj.get(self.index_key):
+            indices = obj.get(self.index_key)
+            if indices is None or len(indices) == 0:
                 continue
+            
             idx = np.array(obj[self.index_key], dtype=np.int64)
             items.append(
                 {
