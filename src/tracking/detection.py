@@ -1,86 +1,50 @@
 from __future__ import annotations
-"""Generic 3D object detection, driven by a declarative rule.
 
-Uses:
-    from .level import DetectionContext, TrackingLevel
-
-:func:`detect_objects` is the single detector used by every
-:class:`~.level.TrackingLevel`. What an "object" is (MCS, convective core, ...)
-is decided only by the rule stored in ``level.params``; this module knows
-nothing about the physical meaning of the variables. All detected objects are
-3D: a 2D variable (e.g. a column quantity such as brightness temperature) can
-be used in a condition, it is simply broadcast over the vertical dimension.
-
-The caller gets back the object's geometry (``indices_3d``, extent, centroid)
-and is expected to compute and analyze whatever physical quantities it needs
-from those voxel coordinates; this module does not compute them.
-
-Rule keys
----------
-Grid
-    ``dx_km`` (1.0)                horizontal grid spacing.
-    ``vertical_dim`` ("level")     vertical dimension of 3D variables.
-    ``vertical_dim_w`` ("level_w") vertical coordinate holding layer heights (m),
-                                   needed for ``height_km`` and ``volume_km3``.
-    ``min_alt_km`` / ``max_alt_km`` optional vertical clipping (km).
-
-Mask (required)
-    ``conditions``: list of ``{"variables": name | [names], "op": ">", "value": x}``,
-    combined with AND. Several variables are summed before the comparison;
-    variables absent from the dataset are ignored. With a parent object, the
-    mask is restricted to the parent's footprint (``indices_3d``).
-
-Objects
-    ``connectivity``   3D connected-component connectivity: 6, 18 or 26 (default 26).
-    ``split``          optional name of a variable. When given, each connected
-                       component is further split by a recursive H-maxima
-                       watershed on that variable (``v`` must be positive
-                       inside the mask); this is the only splitting method.
-    ``min_voxels``, ``min_area_px``, ``min_width_px``, ``min_area_km2``
-                       size filters (default 0).
-"""
-from typing import Optional, List, Dict, Any
 import numpy as np
-from .level import DetectionContext, TrackingLevel
+
 from .functions import (
     compute_component_metrics,
+    connected_components_2d,
     connected_components_3d,
     recursive_watershed_segmentation,
     z_indices_between,
 )
-import os
-Rule = None
 
 _COMPARATORS = {">": np.greater, ">=": np.greater_equal, "<": np.less, "<=": np.less_equal}
 
-_SPLIT_H_SLOPE = 0.3
-_SPLIT_H_MIN = 1.0
-_SPLIT_H_MAX = 10.0
-_SPLIT_MIN_WIDTH_KM = 1.0
-_SPLIT_CONNECTIVITY = 18
-_SPLIT_STACKED_SEEDS_RADIUS = 3
+_SPLIT_DEFAULTS = {
+    "h_slope": 0.3,
+    "h_min": 1.0,
+    "h_max": 10.0,
+    "min_width_km": 1.0,
+    "connectivity": 18,
+    "stacked_seeds_xy_radius": 3,
+    "max_depth": 3,
+}
 
 
-def _cached(context, key, compute):
-    """Compute once per timestep: ``context`` is fresh for every timestep."""
-    cache = context.metadata.setdefault("_fields_cache", {})
-    if key not in cache:
-        cache[key] = compute()
-    return cache[key]
+def _names(condition):
+    names = condition["variables"]
+    return [names] if isinstance(names, str) else list(names)
+
+
+def _split_spec(rule):
+    split = rule.get("split")
+    if not split:
+        return None
+    spec = {"variable": split} if isinstance(split, str) else dict(split)
+    return {**_SPLIT_DEFAULTS, **spec}
+
+
+def _cache(context, name):
+    return context.metadata.setdefault(name, {})
 
 
 def _vertical_indices(context, rule):
-    cache = context.metadata.setdefault("_vertical_cache", {})
-    key = (
-        rule.get("vertical_dim", "level"),
-        rule.get("min_alt_km"),
-        rule.get("max_alt_km"),
-    )
+    key = (rule.get("vertical_dim", "level"), rule.get("min_alt_km"), rule.get("max_alt_km"))
+    cache = _cache(context, "_vertical_cache")
     if key not in cache:
-        coords = np.asarray(
-            context.dataset.coords[key[0]].values, 
-            dtype=np.float32, 
-        )
+        coords = np.asarray(context.dataset.coords[key[0]].values, dtype=float)
         cache[key] = z_indices_between(
             coords,
             -np.inf if key[1] is None else key[1] * 1000.0,
@@ -89,137 +53,85 @@ def _vertical_indices(context, rule):
     return cache[key]
 
 
-def _field(context, rule, name):
+def _load(context, rule, name):
     ds = context.dataset
     if name not in ds:
         return None
     vertical_dim = rule.get("vertical_dim", "level")
-    if vertical_dim not in ds[name].dims:
-        return _cached(context, (name,), lambda: np.asarray(ds[name].data, dtype=float))
+    is_3d = vertical_dim in ds[name].dims
+    key = (name, vertical_dim, rule.get("min_alt_km"), rule.get("max_alt_km")) if is_3d else (name,)
+    cache = _cache(context, "_fields_cache")
+    if key not in cache:
+        da = ds[name].isel({vertical_dim: _vertical_indices(context, rule)}) if is_3d else ds[name]
+        arr = np.asarray(da.values, dtype=np.float32)
+        arr.setflags(write=False)
+        cache[key] = arr
+    return cache[key]
 
-    clip = (rule.get("min_alt_km"), rule.get("max_alt_km"))
-    return _cached(
-        context,
-        (name, vertical_dim, clip),
-        lambda: np.asarray(ds[name].isel({vertical_dim: _vertical_indices(context, rule)}).data, dtype=np.float32),
-    )
 
-
-def _required_field(context, rule, name):
-    field = _field(context, rule, name)
-    if field is None:
-        raise KeyError(f"Variable '{name}' of the split rule is not in the dataset")
-    return field
+def _rule_fields(context, rule):
+    names = {n for c in rule["conditions"] for n in _names(c)}
+    split = _split_spec(rule)
+    if split:
+        names.add(split["variable"])
+    names.update(s["variable"] for s in rule.get("stats", ()))
+    fields = {}
+    for name in names:
+        arr = _load(context, rule, name)
+        if arr is not None:
+            fields[name] = arr
+    return fields
 
 
 def _layer_heights(context, rule):
     dim_w = rule.get("vertical_dim_w", "level_w")
     if dim_w not in context.dataset.coords:
         return None
-    clip = (rule.get("min_alt_km"), rule.get("max_alt_km"))
-    return _cached(
-        context,
-        ("_heights", dim_w, clip),
-        lambda: np.asarray(
+    key = ("_heights", dim_w, rule.get("min_alt_km"), rule.get("max_alt_km"))
+    cache = _cache(context, "_fields_cache")
+    if key not in cache:
+        cache[key] = np.asarray(
             context.dataset[dim_w].isel({dim_w: _vertical_indices(context, rule)}).values, dtype=float
-        ),
-    )
+        )
+    return cache[key]
 
-def _slice_field(field, sl):
-    if field.ndim == 3:
-        return field[sl]
-    if field.ndim == 2:
-        return field[sl[1], sl[2]]
-    return field
 
-def _build_mask(context, rule, preloaded=None, sl=None):
-    if preloaded is None:
-        preloaded = _preload_fields(context, rule)
-    if sl is not None:
-        preloaded = {
-            name: _slice_field(field, sl)
-            for name, field in preloaded.items()
-        }
-    vertical_size = None
-    for f in preloaded.values():
-        if f.ndim == 3:
-            vertical_size = f.shape[0]
-            break
-    if vertical_size is None:
-        vertical_size = len(context.dataset.coords[rule.get("vertical_dim", "level")])
 
+def _slice(field, sl):
+    return field[sl] if field.ndim == 3 else field[sl[1:]]
+
+
+def _build_mask(rule, fields, sl):
+    """2D mask if every condition uses 2D variables, 3D mask otherwise; None if a condition has no variable."""
     mask = None
     for condition in rule["conditions"]:
-        names = condition["variables"]
-        names = [names] if isinstance(names, str) else names
-        fields = [preloaded[name] for name in names if name in preloaded]
-        if not fields:
-            return None 
-
-        fields_2d = [f for f in fields if f.ndim == 2]
-        fields_3d = [f for f in fields if f.ndim == 3]
-
-        if fields_3d:
-            combined_3d = fields_3d[0]
-            for f in fields_3d[1:]:
-                combined_3d += f  
-        else:
-            combined_3d = None
-
-        if fields_2d:
-            for f_2d in fields_2d:
-                if combined_3d is None:
-                    combined_3d = np.zeros((vertical_size, *f_2d.shape), dtype=f_2d.dtype)
-                combined_3d += f_2d
-
-        if combined_3d is None:
-            continue 
-
+        present = [_slice(fields[n], sl) for n in _names(condition) if n in fields]
+        if not present:
+            return None
+        total = present[0]
+        for f in present[1:]:
+            total = total + f
         op = condition.get("op", ">")
-        if op == ">":
-            passed = combined_3d > float(condition["value"])
-        elif op == ">=":
-            passed = combined_3d >= float(condition["value"])
-        elif op == "<":
-            passed = combined_3d < float(condition["value"])
-        elif op == "<=":
-            passed = combined_3d <= float(condition["value"])
-        else:
-            passed = combined_3d > float(condition["value"])  # Default
-
-        if mask is None:
-            mask = passed
-        else: 
-            mask &= passed
-
-    return mask
-
-
-def _restrict_to_parent(mask, parent_object):
-    parent_idx = parent_object.get("indices_3d")
-    if not parent_idx:
-        return None
-    footprint = np.zeros(mask.shape, dtype=bool)
-    idx_array = np.array(parent_idx, dtype=np.int64)
-    footprint[tuple(idx_array.T)] = True
-    np.logical_and(mask, footprint, out=mask)
-    return mask
+        if op not in _COMPARATORS:
+            raise ValueError(f"Unsupported operator '{op}' (use one of {sorted(_COMPARATORS)})")
+        passed = _COMPARATORS[op](total, float(condition["value"]))
+        mask = passed if mask is None else mask & passed
+    return None if mask is None else np.array(mask, dtype=bool)
 
 
 def _label_groups(labels):
+    """Coordinates of each labeled component, in label order."""
     flat = labels.ravel()
     nz = np.flatnonzero(flat)
     if nz.size == 0:
         return []
     order = nz[np.argsort(flat[nz], kind="stable")]
-    sorted_labels = flat[order]
-    splits = np.flatnonzero(np.diff(sorted_labels)) + 1
+    splits = np.flatnonzero(np.diff(flat[order])) + 1
     coords = np.column_stack(np.unravel_index(order, labels.shape))
     return np.split(coords, splits)
 
 
 def _bbox_mask(idx):
-    """Boolean mask cropped to the bounding box of the coordinates, and the box origin."""
     origin = idx.min(axis=0)
     mask = np.zeros(idx.max(axis=0) - origin + 1, dtype=bool)
     mask[tuple((idx - origin).T)] = True
@@ -227,6 +139,10 @@ def _bbox_mask(idx):
 
 
 def _measure(idx, heights, dx_km):
+    if idx.shape[1] == 2:
+        width_px = int(max(np.ptp(idx[:, 0]), np.ptp(idx[:, 1])) + 1)
+        return {"voxels": len(idx), "area_px": len(idx), "area_km2": len(idx) * dx_km**2,
+                "width_px": width_px, "width_km": width_px * dx_km, "height_km": 0.0, "volume_km3": 0.0}
     mask, origin = _bbox_mask(idx)
     layers = None if heights is None else heights[origin[0] : origin[0] + mask.shape[0]]
     return compute_component_metrics(mask, level_vals=layers, dx_km=dx_km)
@@ -241,155 +157,175 @@ def _is_large_enough(metrics, rule):
     )
 
 
-def _condition_threshold(rule, variable):
-    """Threshold applied to ``variable`` in the mask conditions, 0.0 if not found."""
+def _split_orientation(rule, variable):
+    """(sign, reference): sign = -1 when the variable is thresholded from above (``<``, ``<=``)."""
     for condition in rule["conditions"]:
-        names = condition["variables"]
-        names = [names] if isinstance(names, str) else names
-        if variable in names:
-            return float(condition["value"])
-    return 0.0
+        if variable in _names(condition):
+            sign = -1.0 if condition.get("op", ">") in ("<", "<=") else 1.0
+            return sign, sign * float(condition["value"])
+    return 1.0, 0.0
 
-def _describe(idx, metrics):
-    return {
+
+def _split(field, rule, spec, idx, dx_km):
+    sign, reference = _split_orientation(rule, spec["variable"])
+    flat = idx.shape[1] == 2
+    if flat and field.ndim == 3:
+        raise ValueError(f"A 2D object cannot be split on the 3D variable '{spec['variable']}'")
+    points = np.column_stack([np.zeros(len(idx), dtype=idx.dtype), idx]) if flat else idx
+    values = field[idx[:, 0], idx[:, 1]] if flat else field[tuple(idx.T)]
+
+    def compute_adaptive_h(v):
+        h = spec["h_slope"] * (float(v.max()) - reference)
+        return float(min(max(h, spec["h_min"]), spec["h_max"]))
+
+    def stop_condition(mask):
+        return compute_component_metrics(mask, dx_km=dx_km)["width_median_km"] <= spec["min_width_km"]
+
+    groups = recursive_watershed_segmentation(
+        points,
+        sign * values,
+        compute_adaptive_h=compute_adaptive_h,
+        stop_condition=stop_condition,
+        connectivity=spec["connectivity"],
+        merge_stacked=True,
+        stacked_seeds_xy_radius=spec["stacked_seeds_xy_radius"],
+        max_depth=spec["max_depth"],
+    )
+    return [g["indices"][:, 1:] if flat else g["indices"] for g in groups]
+
+
+def _stat_values(field, idx, kind, half_depth):
+    if idx.shape[1] == 2:
+        return field[:, idx[:, 0], idx[:, 1]] if field.ndim == 3 else field[idx[:, 0], idx[:, 1]]
+    if field.ndim == 2:
+        return field[idx[:, 1], idx[:, 2]]
+    if kind == "layer_mean":
+        zc = int(round(float(idx[:, 0].mean())))
+        near = np.abs(idx[:, 0] - zc) <= half_depth
+        idx = idx[near] if near.any() else idx
+    return field[tuple(idx.T)]
+
+
+def _compute_stats(rule, fields, idx):
+    out = {}
+    for stat in rule.get("stats", ()):
+        field = fields.get(stat["variable"])
+        if field is None:
+            continue
+        kind = stat.get("stat", "mean")
+        values = _stat_values(field, idx, kind, stat.get("half_depth", 2))
+        if kind in ("mean", "layer_mean"):
+            out[stat["name"]] = float(np.nanmean(values))
+        elif kind in ("min", "max", "sum"):
+            out[stat["name"]] = float(getattr(np, f"nan{kind}")(values))
+        elif kind == "percentile":
+            out[stat["name"]] = float(np.nanpercentile(values, stat["q"]))
+        else:
+            raise ValueError(f"Unsupported stat '{kind}'")
+    return out
+
+
+def _footprint_2d(idx):
+    width = int(idx[:, 2].max()) + 1
+    keys = np.unique(idx[:, 1].astype(np.int64) * width + idx[:, 2])
+    return np.column_stack(np.divmod(keys, width))
+
+
+def _describe(idx, metrics, stats):
+    obj = {
         "area_km2": metrics["area_km2"],
         "volume_km3": metrics["volume_km3"],
         "width_km": metrics["width_km"],
         "height_km": metrics["height_km"],
-        "centroid_x": float(idx[:, 2].mean()),
-        "centroid_y": float(idx[:, 1].mean()),
-        "centroid_z": float(idx[:, 0].mean()),
-        "indices_3d": np.asarray(idx, dtype=np.int64),
+        "centroid_x": float(idx[:, -1].mean()),
+        "centroid_y": float(idx[:, -2].mean()),
     }
+    if idx.shape[1] == 3:
+        obj["centroid_z"] = float(idx[:, 0].mean())
+    obj.update(stats)
+    if idx.shape[1] == 3:
+        obj["indices_3d"] = idx
+        obj["indices_2d"] = _footprint_2d(idx)
+    else:
+        obj["indices_2d"] = idx
+    return obj
 
-def _preload_fields(context, rule):
-    ds = context.dataset
-    vertical_dim = rule.get("vertical_dim", "level")
-    z_idx = _vertical_indices(context, rule)
 
-    preloaded = {}
-    for condition in rule["conditions"]:
-        names = condition["variables"]
-        names = [names] if isinstance(names, str) else names
-        for name in names:
-            if name not in preloaded and name in ds:
-                if vertical_dim in ds[name].dims:
-                    preloaded[name] = ds[name].isel({vertical_dim: z_idx}).values.astype(np.float32)
-                else:
-                    preloaded[name] = ds[name].values.astype(np.float32)
-    return preloaded
+def _parent_region(parent_object):
+    """(parent indices, origin (z, y, x), slices) of the parent's bounding box."""
+    idx = parent_object.get("indices_3d")
+    if idx is not None and len(idx):
+        idx = np.asarray(idx, dtype=np.int64)
+        origin = idx.min(axis=0)
+        return idx, origin, tuple(slice(a, b) for a, b in zip(origin, idx.max(axis=0) + 1))
+    idx = parent_object.get("indices_2d")
+    if idx is None or not len(idx):
+        return None, None, None
+    idx = np.asarray(idx, dtype=np.int64)
+    lo, hi = idx.min(axis=0), idx.max(axis=0) + 1
+    return idx, np.array([0, lo[0], lo[1]]), (slice(None), slice(lo[0], hi[0]), slice(lo[1], hi[1]))
+
+
+def _restrict(mask, pidx, origin):
+    if pidx.shape[1] == 3 and mask.ndim == 3:
+        footprint = np.zeros(mask.shape, dtype=bool)
+        footprint[tuple((pidx - origin).T)] = True
+    else:
+        yx = pidx[:, -2:] - origin[1:]
+        footprint = np.zeros(mask.shape[-2:], dtype=bool)
+        footprint[yx[:, 0], yx[:, 1]] = True
+    mask &= footprint
+    return mask
 
 
 def detect_objects(context, parent_object, level):
     rule = level.params
-    field = _cached(context, ("fields", level.name), lambda: _preload_fields(context, rule))
+    fields = _rule_fields(context, rule)
 
     if parent_object is None:
-        sl, origin, pidx = (slice(None),) * 3, np.zeros(3, dtype=np.int64), None
+        origin, sl, pidx = np.zeros(3, dtype=np.int64), (slice(None),) * 3, None
     else:
-        pidx = np.asarray(parent_object["indices_3d"], dtype=np.int64)
-        origin = pidx.min(axis=0)
-        sl = tuple(slice(a, b) for a, b in zip(origin, pidx.max(axis=0) + 1))
+        pidx, origin, sl = _parent_region(parent_object)
+        if pidx is None:
+            return []
 
-    mask = _build_mask(context, rule, field, sl)
-    
+    mask = _build_mask(rule, fields, sl)
+    if mask is None:
+        return []
     if pidx is not None:
-        fp = np.zeros(mask.shape, dtype=bool)
-        fp[tuple((pidx - origin).T)] = True
-        mask &= fp
+        mask = _restrict(mask, pidx, origin)
     if not mask.any():
         return []
-    
-    labels, _ = connected_components_3d(mask, rule.get("connectivity") or 26)
-    groups = [g + origin for g in _label_groups(labels)]
+
+    connectivity = rule.get("connectivity")
+    if mask.ndim == 3:
+        labels, _ = connected_components_3d(mask, connectivity or 26)
+        offset = origin
+    else:
+        labels, _ = connected_components_2d(mask, 4 if connectivity in (4, 6) else 8)
+        offset = origin[1:]
 
     dx_km = float(rule.get("dx_km", 1.0))
-    heights = _layer_heights(context, rule)
-    split_variable = rule.get("split")
+    heights = _layer_heights(context, rule) if mask.ndim == 3 else None
+    split = _split_spec(rule)
+    split_field = fields.get(split["variable"]) if split else None
+    if split and split_field is None:
+        raise KeyError(f"Split variable '{split['variable']}' is not in the dataset")
+    if split_field is not None and mask.ndim == 3 and split_field.ndim == 2:
+        split_field = np.broadcast_to(split_field, (len(_vertical_indices(context, rule)), *split_field.shape))
 
-    labels, _ = connected_components_3d(mask, rule.get("connectivity") or 26)
-    groups = [g + origin for g in _label_groups(labels)]
     objects = []
-    for group in groups:
+    for group in _label_groups(labels):
+        group += offset
         if len(group) < rule.get("min_voxels", 0):
             continue
-
         metrics = _measure(group, heights, dx_km)
         if not _is_large_enough(metrics, rule):
             continue
 
-        if split_variable and field is not None:
-            parts = _recursive_split_fast(
-                field[split_variable],
-                rule,
-                split_variable,
-                group,
-                dx_km,
-                reference=_condition_threshold(rule, split_variable)
-            )
-        else:
-            parts = [group]
-
+        parts = _split(split_field, rule, split, group, dx_km) if split_field is not None else [group]
         for part in parts:
-            if part is group:
-                part_metrics = metrics
-            else:
-                part_metrics = _measure(part, heights, dx_km)
+            part_metrics = metrics if part is group else _measure(part, heights, dx_km)
             if _is_large_enough(part_metrics, rule):
-                objects.append(_describe(part, part_metrics))
-
+                objects.append(_describe(part, part_metrics, _compute_stats(rule, fields, part)))
     return objects
-
-def _recursive_split_fast(field, rule, variable, idx, dx_km, reference, max_depth=1):
-    if len(idx) == 0 or max_depth <= 0:
-        return [idx]
-
-    values = field[tuple(idx.T)]
-    if values.size == 0:
-        return [idx]
-
-    threshold = reference + (float(values.max()) - reference) * _SPLIT_H_SLOPE
-    threshold = min(max(threshold, _SPLIT_H_MIN), _SPLIT_H_MAX)
-    origin = idx.min(axis=0)
-    shape = idx.max(axis=0) - origin + 1
-    local_field = np.zeros(shape, dtype=np.float32)
-    local_field[tuple((idx - origin).T)] = values
-    split_mask = local_field > threshold
-    labels, _ = connected_components_3d(split_mask, _SPLIT_CONNECTIVITY)
-
-    parts = []
-    for label in np.unique(labels):
-        if label == 0:
-            continue
-        local_coords = np.argwhere(labels == label)
-        global_coords = local_coords + origin
-        if len(global_coords) >= rule.get("min_voxels", 5):
-            parts.append(global_coords)
-
-    return parts if parts else [idx]
-
-def _recursive_split(
-    context, rule, variable, idx, dx_km, max_depth=3
-):
-    """Split one component by recursive H-maxima watershed on ``variable``."""
-    field = _required_field(context, rule, variable)
-    reference = _condition_threshold(rule, variable)
-
-    def compute_adaptive_h(values):
-        h = _SPLIT_H_SLOPE * (float(values.max()) - reference)
-        return float(min(max(h, _SPLIT_H_MIN), _SPLIT_H_MAX))
-
-    def stop_condition(mask):
-        return compute_component_metrics(mask, dx_km=dx_km)["width_median_km"] <= _SPLIT_MIN_WIDTH_KM
-
-    subgroups = recursive_watershed_segmentation(
-        idx,
-        field[tuple(idx.T)],
-        compute_adaptive_h=compute_adaptive_h,
-        stop_condition=stop_condition,
-        connectivity=_SPLIT_CONNECTIVITY,
-        merge_stacked=True,
-        stacked_seeds_xy_radius=_SPLIT_STACKED_SEEDS_RADIUS,
-        max_depth=max_depth,
-    )
-    return [np.array(group["indices"], dtype=np.int64) for group in subgroups]
