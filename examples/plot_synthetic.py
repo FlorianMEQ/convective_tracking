@@ -5,7 +5,7 @@ import numpy as np
 from matplotlib.lines import Line2D
 
 STYLE = {
-    "cloud": dict(color="#4c78a8", lw=2.0, ls="-"),
+    "mcs": dict(color="#4c78a8", lw=2.0, ls="-"),
     "updraft": dict(color="#f58518", lw=1.6, ls="-"),
     "downdraft": dict(color="#2ca02c", lw=1.6, ls="--"),
     "core": dict(color="#d62728", lw=1.4, ls="-"),
@@ -31,7 +31,7 @@ def plot_scene(frame, y_section=30):
     im = ax1.imshow(w_col, origin="lower", cmap="RdBu_r", vmin=-wmax, vmax=wmax)
     ax1.contour(hydro.max(axis=0), levels=[0.05], colors="k", linewidths=1.2)
     ax1.axhline(y_section, color="k", ls=":", lw=0.8)
-    for name, (yy, xx) in {"cloud A": (45, 28), "cloud B": (42, 84)}.items():
+    for name, (yy, xx) in {"mcs A": (45, 28), "mcs B": (42, 84)}.items():
         ax1.annotate(name, (xx, yy), ha="center", fontsize=9)
     fig.colorbar(im, ax=ax1, label="W (m/s)")
 
